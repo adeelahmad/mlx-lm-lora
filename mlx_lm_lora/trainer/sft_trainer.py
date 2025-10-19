@@ -35,7 +35,9 @@ def grad_checkpoint(layer):
 class SFTTrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
     iters: int = field(default=100, metadata={"help": "Iterations to train for."})
-    gradient_accumulation_steps: int = field(default=1, metadata={"help": "Number of gradient accumulation steps."})
+    gradient_accumulation_steps: int = field(
+        default=1, metadata={"help": "Number of gradient accumulation steps."}
+    )
     val_batches: int = field(
         default=25,
         metadata={
@@ -125,9 +127,7 @@ def iterate_batches(
             for j in range(batch_size // step):
                 truncated_length = min(lengths[j], max_seq_length)
                 batch_arr[j, :truncated_length] = batch[j][:truncated_length]
-                lengths[j] = (
-                    truncated_length
-                )
+                lengths[j] = truncated_length
             batch = mx.array(batch_arr)
             yield batch, mx.array(list(zip(offsets, lengths)))
 
@@ -214,12 +214,14 @@ def train_sft(
     # Main training loop
     pbar = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
     for it in pbar:
-        batch = next(iterate_batches(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            max_seq_length=args.max_seq_length,
-            train=True,
-        ))
+        batch = next(
+            iterate_batches(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                max_seq_length=args.max_seq_length,
+                train=True,
+            )
+        )
         tic = time.perf_counter()
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             tic = time.perf_counter()
@@ -268,10 +270,12 @@ def train_sft(
             trained_tokens += n_tokens
             peak_mem = mx.get_peak_memory() / 1e9
             if rank == 0:
-                pbar.set_postfix({
-                    'loss': f"{train_loss:.3f}",
-                    'it/s': f"{it_sec:.3f}",
-                })
+                pbar.set_postfix(
+                    {
+                        "loss": f"{train_loss:.3f}",
+                        "it/s": f"{it_sec:.3f}",
+                    }
+                )
                 tqdm.write(
                     f"\nIter {it}: "
                     f"loss {train_loss:.3f}, "

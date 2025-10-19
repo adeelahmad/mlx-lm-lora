@@ -36,10 +36,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         default=1e-4, metadata={"help": "The Epsilon for numerical stability."}
     )
     epsilon_high: float = field(
-        default=None,
-        metadata={
-            "help": "For DAPO Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound specified in argument epsilon."
-        },
+        default=None, metadata={"help": "For DAPO Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound specified in argument epsilon."}
     )
     max_completion_length: int = field(
         default=512, metadata={"help": "Number of Generations."}
@@ -60,7 +57,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         default="grpo",
         metadata={
             "help": "Type of loss to use for GRPO. Supported: 'grpo', 'bnpo', 'dr_grpo'."
-        },
+        }
     )
     reward_weights: Optional[List[float]] = field(
         default=None,
@@ -72,11 +69,17 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         default=None,
         metadata={
             "help": "importance_sampling_level (`str`, *optional*, defaults to None): "
-            "Controls whether importance sampling ratios are computed at the 'token' or 'sequence' level. "
-            "keeps the raw per-token log-probability ratios (one weight per token).  'sequence' averages the "
-            "log-probability ratios across valid tokens to produce a single ratio per sequence. The "
-            "GSPO paper https://huggingface.co/papers/2507.18071) shows that sequence-level sampling often yields more "
-            "stable training and better alignment with  sequence-level rewards.."
+                "Controls whether importance sampling ratios are computed at the 'token' or 'sequence' level. "
+                "keeps the raw per-token log-probability ratios (one weight per token).  'sequence' averages the "
+                "log-probability ratios across valid tokens to produce a single ratio per sequence. The "
+                "GSPO paper https://huggingface.co/papers/2507.18071) shows that sequence-level sampling often yields more "
+                "stable training and better alignment with sequence-level rewards."
+        },
+    )
+    use_answer_tags: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enforce answer tags in generation. If False, answer tags are optional."
         },
     )
 
@@ -98,7 +101,6 @@ def get_per_token_logps(model: nn.Module, inputs, lengths):
     mx.eval(logits)
     return per_token_logps
 
-
 def generate_grpo(
     model: nn.Module,
     tokenizer,
@@ -107,8 +109,23 @@ def generate_grpo(
     group_size: int,
     temperature: float,
     batch_size: int,
-    end_token: str = "</answer>",
+    end_token: Optional[str] = None,  # Changed to Optional with default None
+    stop_at_think_close: bool = True  # Option to stop at </think> instead
 ):
+    """
+    Generate completions for GRPO training.
+
+    Args:
+        model: The language model
+        tokenizer: The tokenizer
+        prompt_tokens: List of tokenized prompts
+        max_tokens: Maximum number of tokens to generate
+        group_size: Number of completions per prompt
+        temperature: Sampling temperature
+        batch_size: Batch size for generation
+        end_token: Optional end token to stop generation (e.g., "</answer>")
+        stop_at_think_close: If True and no end_token, stop at "</think>" + some content
+    """
     model.eval()
     all_completions = []
     all_completion_texts = []
@@ -131,12 +148,11 @@ def generate_grpo(
                     top_k=0,
                     xtc_probability=0.0,
                     xtc_threshold=0.0,
-                    xtc_special_tokens=tokenizer.encode("\n")
-                    + list(tokenizer.eos_token_ids),
+                    xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
                 )
 
                 prompt_cache = cache.make_prompt_cache(model)
-                completion: str | List[int] = generate(
+                completion = generate(
                     model=model,
                     tokenizer=tokenizer,
                     prompt=prompt_text,
@@ -148,20 +164,52 @@ def generate_grpo(
 
                 if isinstance(completion, str):
                     completion_ids = tokenizer.encode(completion)
+                    completion_text = completion
                 else:
                     completion_ids = completion
+                    completion_text = tokenizer.decode(completion_ids)
 
+                # Handle different stopping conditions
                 if end_token:
+                    # If a specific end token is provided, use it
                     end_sequence = tokenizer.encode(end_token)
-                    if (
-                        len(completion_ids) >= len(end_sequence)
-                        and completion_ids[-len(end_sequence) :] == end_sequence
-                    ):
-                        completion_ids = completion_ids[: -len(end_sequence)]
+                    if len(completion_ids) >= len(end_sequence):
+                        # Check if the completion ends with the end_token
+                        if completion_ids[-len(end_sequence):] == end_sequence:
+                            completion_ids = completion_ids[:-len(end_sequence)]
+                elif stop_at_think_close and "</think>" in completion_text:
+                    # If no end_token but we want to stop after </think> content
+                    # Find the position after </think> and keep some content after it
+                    think_close_pos = completion_text.find("</think>")
+                    if think_close_pos != -1:
+                        # Keep content up to </think> plus a reasonable amount after
+                        # This ensures we have the answer content after </think>
+                        after_think = completion_text[think_close_pos + 8:]  # 8 is len("</think>")
+
+                        # If there's content after </think>, keep it
+                        # But stop at natural boundaries like double newlines or answer tags if present
+                        if after_think:
+                            # Look for natural stopping points
+                            natural_stops = ["\n\n", "<answer>", "</answer>"]
+                            min_stop = len(after_think)
+
+                            for stop in natural_stops:
+                                pos = after_think.find(stop)
+                                if pos != -1 and pos < min_stop:
+                                    min_stop = pos
+
+                            # If we found </answer>, include it
+                            if "</answer>" in after_think[:min_stop + 10]:
+                                answer_end = after_think.find("</answer>")
+                                if answer_end != -1:
+                                    min_stop = answer_end + 9  # Include </answer>
+
+                            truncated_completion = completion_text[:think_close_pos + 8 + min_stop]
+                            completion_ids = tokenizer.encode(truncated_completion)
 
                 completion_ids = mx.array(completion_ids)
                 all_completions.append(mx.stop_gradient(completion_ids))
-                all_completion_texts.append(completion)
+                all_completion_texts.append(completion_text)
                 batch_indices.append(i + j)
 
     mx.clear_cache()
@@ -187,6 +235,7 @@ def grpo_loss(
     batch_size: int = 1,
     importance_sampling_level: str = "token",
     grpo_loss_type: str = "grpo",
+    use_answer_tags: bool = False,  # New parameter to control answer tag usage
 ):
     prompt_tokens, _, prompt_text, answer_text, type_info = batch
 
@@ -199,6 +248,9 @@ def grpo_loss(
         all_completion_texts = completion_texts
         batch_indices = batch_indices
     else:
+        # Determine end_token based on use_answer_tags parameter
+        end_token = "</answer>" if use_answer_tags else None
+
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             tokenizer=tokenizer,
@@ -207,6 +259,8 @@ def grpo_loss(
             group_size=group_size,
             temperature=temperature,
             batch_size=batch_size,
+            end_token=end_token,
+            stop_at_think_close=not use_answer_tags,  # Stop at </think> if not using answer tags
         )
 
     if not all_completions:
@@ -232,283 +286,213 @@ def grpo_loss(
         for idx in completion_indices:
             ordered_completions.append(all_completions[idx])
             ordered_completion_texts.append(all_completion_texts[idx])
-            ordered_batch_indices.append(prompt_idx)
+            ordered_batch_indices.append(batch_indices[idx])
             expanded_answers.append(answer_text[prompt_idx])
             expanded_prompts.append(prompt_text[prompt_idx])
-            expanded_types.append(
-                type_info[prompt_idx] if type_info is not None else None
-            )
+            expanded_types.append(type_info[prompt_idx] if type_info else None)
 
-    all_completions = ordered_completions
-    all_completion_texts = ordered_completion_texts
-    batch_indices = ordered_batch_indices
-    max_length = max(ids.shape[0] for ids in all_completions)
-    padded_completions = []
-    attention_masks = []
-
-    for completion_ids in all_completions:
-        completion_tensor = mx.array(completion_ids.tolist())
-        padding_length = max_length - completion_tensor.shape[0]
-        if padding_length > 0:
-            padding = mx.zeros((padding_length,), dtype=completion_tensor.dtype)
-            padded_ids = mx.concatenate([completion_tensor, padding])
-            mask = mx.concatenate(
-                [mx.ones_like(completion_tensor), mx.zeros_like(padding)]
-            )
-        else:
-            padded_ids = completion_tensor
-            mask = mx.ones_like(completion_tensor)
-        padded_completions.append(padded_ids)
-        attention_masks.append(mask)
-
-    inputs = mx.stack(padded_completions)
-    attention_mask = mx.stack(attention_masks)
-    lengths = attention_mask.sum(axis=1)
-
-    token_log_probs = get_per_token_logps(model, inputs, lengths)
-    mx.eval(token_log_probs)
-
-    if ref_model is None:
-        ref_token_log_probs = token_log_probs
-    else:
-        ref_token_log_probs = get_per_token_logps(ref_model, inputs, lengths)
-        mx.eval(ref_token_log_probs)
-
-    max_len = max(x.shape[0] for x in token_log_probs)
-    padded_log_probs = []
-    padded_ref_log_probs = []
-
-    for i in range(len(token_log_probs)):
-        seq_len = token_log_probs[i].shape[0]
-        padding = mx.zeros((max_len - seq_len,))
-
-        padded_log_probs.append(mx.concatenate([token_log_probs[i], padding]))
-        padded_ref_log_probs.append(mx.concatenate([ref_token_log_probs[i], padding]))
-
-    token_log_probs = mx.stack(padded_log_probs)
-    ref_token_log_probs = mx.stack(padded_ref_log_probs)
-
-    all_func_rewards = []
-    for reward_func in reward_funcs:
-        raw_rewards = reward_func(
-            prompts=expanded_prompts,
-            completions=all_completion_texts,
-            answer=expanded_answers,
-            types=expanded_types,
-        )
-        if raw_rewards is None:
-            processed_rewards = [float("nan")] * len(all_completion_texts)
-        else:
-            processed_rewards = [
-                float(r) if r is not None else float("nan") for r in raw_rewards
-            ]
-        func_rewards = mx.array(processed_rewards)
-        all_func_rewards.append(func_rewards)
-
-    rewards = mx.stack(all_func_rewards, axis=1)
-
-    all_nan_rows = mx.all(mx.isnan(rewards), axis=1)
-    if mx.any(all_nan_rows):
-        nan_row_idx = mx.argmax(all_nan_rows).item()
-        warning_msg = (
-            f"All reward functions returned None for prompt: {expanded_prompts[nan_row_idx]}, "
-            f"completion: {all_completion_texts[nan_row_idx]}, "
-            f"answer: {expanded_answers[nan_row_idx]}. "
-            "Please ensure that at least one reward function returns a valid reward."
-        )
-        raise RuntimeError(warning_msg)
-
-    if reward_weights is not None:
-        if len(reward_weights) != len(reward_funcs):
-            raise ValueError(
-                f"Number of reward weights ({len(reward_weights)}) must match number of reward "
-                f"functions ({len(reward_funcs)})"
-            )
-        reward_weights = mx.array(reward_weights, dtype=mx.float32)
-    else:
-        reward_weights = mx.ones(len(reward_funcs), dtype=mx.float32)
-
-    valid_reward_mask = ~mx.isnan(rewards)
-    rewards_no_nan = mx.where(valid_reward_mask, rewards, mx.zeros_like(rewards))
-    rewards = (rewards_no_nan * mx.expand_dims(reward_weights, 0)).sum(axis=1)
-
-    num_unique_prompts = len(unique_prompt_indices)
-
-    rewards_by_prompt = [[] for _ in range(num_unique_prompts)]
-    for i, prompt_idx in enumerate(batch_indices):
-        prompt_position = unique_prompt_indices.index(prompt_idx)
-        rewards_by_prompt[prompt_position].append(rewards[i])
-
-    advantages = mx.zeros_like(rewards)
-    for i, prompt_rewards in enumerate(rewards_by_prompt):
-        if len(prompt_rewards) > 1:
-            prompt_rewards = mx.array(prompt_rewards)
-            mean_reward = mx.mean(prompt_rewards)
-            std_reward = mx.std(prompt_rewards)
-            indices = [
-                j
-                for j, idx in enumerate(batch_indices)
-                if idx == unique_prompt_indices[i]
-            ]
-            for j, idx in enumerate(indices):
-                advantages[idx] = (prompt_rewards[j] - mean_reward) / (
-                    std_reward + 1e-4
-                )
-        else:
-            idx = batch_indices.index(unique_prompt_indices[i])
-            advantages[idx] = 0.0
-
-    # Compute KL divergence using Schulman's approximator
-    kl_div = (
-        mx.exp(ref_token_log_probs - token_log_probs)
-        - (ref_token_log_probs - token_log_probs)
-        - 1
-    )
-
-    # Create mask for valid tokens
-    length_mask = mx.arange(inputs.shape[1] - 1)[None, :] < (lengths[:, None] - 1)
-
-    # Compute log ratio for importance sampling
-    log_ratio = token_log_probs - mx.stop_gradient(ref_token_log_probs)
-
-    # Apply importance sampling based on level
-    if importance_sampling_level == "token":
-        log_importance_weights = log_ratio
-    elif importance_sampling_level == "sequence":
-        # Average log ratio over sequence length for each sequence
-        sequence_log_ratio = (log_ratio * length_mask).sum(axis=1) / mx.maximum(
-            length_mask.sum(axis=1), 1.0
-        )
-        log_importance_weights = mx.expand_dims(sequence_log_ratio, axis=1)
-    elif importance_sampling_level is None or importance_sampling_level == "none":
-        log_importance_weights = mx.zeros_like(log_ratio)
-    else:
-        raise ValueError(
-            f"Unknown importance sampling level: {importance_sampling_level}. "
-            "Possible values are 'token', 'sequence', or None."
-        )
-
-    # Calculate importance weights
-    coef_1 = mx.exp(log_importance_weights)
-
-    # Apply PPO like clipping
-    epsilon_high = epsilon_high if epsilon_high else epsilon
-    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
-
-    # Track clipping metrics
-    is_low_clipped = (coef_1 < 1 - epsilon) & (advantages.reshape(-1, 1) < 0)
-    is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages.reshape(-1, 1) > 0)
-    is_region_clipped = is_low_clipped | is_high_clipped
-
-    # Calculate both unclipped and clipped objectives
-    unclipped_obj = coef_1 * advantages.reshape(-1, 1)
-    clipped_obj = coef_2 * advantages.reshape(-1, 1)
-
-    # Take the minimum (pessimistic bound)
-    per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
-
-    # Add KL penalty if beta is non-zero
-    if beta != 0.0:
-        per_token_loss = per_token_loss + beta * kl_div
-
-    if grpo_loss_type == "grpo":
-        loss = (per_token_loss * length_mask).sum() / length_mask.sum()
-    elif grpo_loss_type == "bnpo":
-        loss = (per_token_loss * length_mask).sum() / mx.maximum(length_mask.sum(), 1.0)
-    elif grpo_loss_type == "dr_grpo":
-        loss = (per_token_loss * length_mask).sum() / (
-            per_token_loss.shape[0] * max_tokens
-        )
-    else:
-        raise ValueError(f"Unknown loss type: {grpo_loss_type}")
-
-    # Calculate mean KL divergence for metrics
-    mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
-
-    reward_metrics = {}
-    for i, reward_func in enumerate(reward_funcs):
-        func_name = reward_func.__name__
-        raw_rewards = reward_func(
-            prompts=expanded_prompts,
-            completions=all_completion_texts,
-            answer=expanded_answers,
-        )
-        valid_mask = ~mx.isnan(
-            mx.array(
-                [
-                    reward if reward is not None else float("nan")
-                    for reward in raw_rewards
-                ]
-            )
-        )
-        valid_rewards = mx.array(
-            [
-                reward
-                for reward in raw_rewards
-                if reward is not None and not mx.isnan(reward)
-            ]
-        )
-        if len(valid_rewards) > 0:
-            reward_metrics[f"{func_name}_mean"] = mx.mean(valid_rewards)
-            reward_metrics[f"{func_name}_std"] = (
-                mx.std(valid_rewards) if len(valid_rewards) > 1 else mx.zeros(1)
-            )
-            reward_metrics[f"{func_name}_coverage"] = valid_mask.sum() / len(
-                raw_rewards
-            )
-        else:
-            reward_metrics[f"{func_name}_mean"] = float("nan")
-            reward_metrics[f"{func_name}_std"] = float("nan")
-            reward_metrics[f"{func_name}_coverage"] = 0.0
-
-    grouped_rewards_mean = mx.array(
-        [mx.mean(mx.array(rewards)) for rewards in rewards_by_prompt]
-    )
-    grouped_rewards_std = mx.array(
-        [
-            mx.std(mx.array(rewards)) if len(rewards) > 1 else mx.zeros(1)
-            for rewards in rewards_by_prompt
+    if not reward_funcs:
+        reward_funcs = [
+            r1_accuracy_reward_func,
+            r1_int_reward_func,
+            r1_strict_format_reward_func,
+            r1_soft_format_reward_func,
+            r1_count_xml,
         ]
-    )
+
+    if reward_weights is None:
+        reward_weights = [1.0] * len(reward_funcs)
+    elif len(reward_weights) != len(reward_funcs):
+        raise ValueError(
+            f"reward_weights must have same length as reward_funcs. "
+            f"Got {len(reward_weights)} weights for {len(reward_funcs)} functions."
+        )
+
+    all_rewards = []
+    reward_details = {func.__name__: [] for func in reward_funcs}
+
+    for i, reward_func in enumerate(reward_funcs):
+        rewards = reward_func(
+            expanded_prompts, ordered_completion_texts, expanded_answers, expanded_types
+        )
+        weighted_rewards = [r * reward_weights[i] for r in rewards]
+        all_rewards.append(weighted_rewards)
+        reward_details[reward_func.__name__] = rewards
+
+    total_rewards = [
+        sum(all_rewards[j][i] for j in range(len(reward_funcs)))
+        for i in range(len(ordered_completion_texts))
+    ]
+
+    grouped_rewards = []
+    for prompt_idx in unique_prompt_indices:
+        completion_indices = grouped_completions[prompt_idx]
+        prompt_rewards = [total_rewards[idx] for idx in completion_indices]
+        grouped_rewards.append(prompt_rewards)
+
+    model.train()
+    if ref_model is not None:
+        ref_model.eval()
+
+    all_inputs = []
+    all_lengths = []
+    for prompt, completion in zip(prompt_tokens, ordered_completions):
+        inputs = mx.concatenate([prompt, completion])
+        all_inputs.append(inputs)
+        all_lengths.append(len(inputs))
+
+    max_len = max(all_lengths)
+    padded_inputs = []
+    for inputs, length in zip(all_inputs, all_lengths):
+        padded = mx.pad(inputs, [(0, max_len - length)], constant_values=tokenizer.pad_token_id)
+        padded_inputs.append(padded)
+
+    batch_inputs = mx.stack(padded_inputs)
+    batch_lengths = mx.array(all_lengths)
+
+    policy_per_token_logps = get_per_token_logps(model, batch_inputs, batch_lengths)
+
+    if ref_model is not None:
+        with mx.no_grad():
+            ref_per_token_logps = get_per_token_logps(ref_model, batch_inputs, batch_lengths)
+    else:
+        ref_per_token_logps = policy_per_token_logps
+
+    prompt_token_counts = [len(p) for p in prompt_tokens]
+
+    all_losses = mx.array(0.0)
+    ntokens = 0
+    policy_logps = []
+    ref_logps = []
+    kls = []
+    loss_masks = []
+    ratios = []
+    clipped_low_count = 0
+    clipped_high_count = 0
+    total_comparisons = 0
+
+    for i, (policy_logp, ref_logp, prompt_len) in enumerate(
+        zip(policy_per_token_logps, ref_per_token_logps, prompt_token_counts)
+    ):
+        completion_logp = policy_logp[prompt_len:]
+        ref_completion_logp = ref_logp[prompt_len:]
+
+        if len(completion_logp) == 0:
+            continue
+
+        if importance_sampling_level == "sequence":
+            policy_logp_sum = mx.sum(completion_logp)
+            ref_logp_sum = mx.sum(ref_completion_logp)
+            ratio = mx.exp(policy_logp_sum - ref_logp_sum)
+            ratios.append(ratio)
+        else:
+            ratio = mx.exp(completion_logp - ref_completion_logp)
+            ratios.extend([r.item() for r in ratio])
+
+        policy_logps.append(mx.sum(completion_logp))
+        ref_logps.append(mx.sum(ref_completion_logp))
+        kl = mx.sum(ref_completion_logp - completion_logp)
+        kls.append(kl)
+
+        loss_mask = mx.ones_like(completion_logp)
+        loss_masks.append(loss_mask)
+        ntokens += len(completion_logp)
+
+    all_losses = mx.array(0.0)
+
+    for prompt_idx, prompt_rewards in enumerate(grouped_rewards):
+        if len(prompt_rewards) == 0:
+            continue
+
+        baseline = np.mean(prompt_rewards)
+        advantages = [r - baseline for r in prompt_rewards]
+
+        start_idx = prompt_idx * group_size
+        end_idx = start_idx + len(prompt_rewards)
+
+        for i, advantage in enumerate(advantages):
+            idx = start_idx + i
+            if idx >= len(policy_logps):
+                break
+
+            kl_penalty = kls[idx] if idx < len(kls) else mx.array(0.0)
+
+            if grpo_loss_type == "grpo":
+                if importance_sampling_level == "sequence":
+                    ratio = ratios[idx]
+                    epsilon_high_value = epsilon_high if epsilon_high is not None else epsilon
+                    clipped_ratio = mx.clip(ratio, 1.0 - epsilon, 1.0 + epsilon_high_value)
+
+                    if ratio < (1.0 - epsilon):
+                        clipped_low_count += 1
+                    if ratio > (1.0 + epsilon_high_value):
+                        clipped_high_count += 1
+                    total_comparisons += 1
+
+                    loss = -clipped_ratio * advantage * policy_logps[idx]
+                else:
+                    loss = -advantage * policy_logps[idx]
+            elif grpo_loss_type == "bnpo":
+                loss = -advantage * policy_logps[idx] - beta * ref_logps[idx]
+            elif grpo_loss_type == "dr_grpo":
+                dr_factor = mx.minimum(
+                    1.0,
+                    mx.sqrt(mx.exp(policy_logps[idx] - ref_logps[idx]))
+                )
+                loss = -dr_factor * advantage * policy_logps[idx]
+            else:
+                raise ValueError(f"Unknown GRPO loss type: {grpo_loss_type}")
+
+            loss = loss + beta * kl_penalty
+            all_losses = all_losses + loss
+
+    avg_loss = all_losses / ntokens if ntokens > 0 else mx.array(0.0)
+
+    # Calculate metrics
+    total_rewards_mean = np.mean(total_rewards) if total_rewards else 0
+    total_rewards_std = np.std(total_rewards) if total_rewards else 0
+    grouped_rewards_flat = [r for group in grouped_rewards for r in group]
+    grouped_rewards_mean = np.mean(grouped_rewards_flat) if grouped_rewards_flat else 0
+    grouped_rewards_std = np.std(grouped_rewards_flat) if grouped_rewards_flat else 0
+    kl_mean = np.mean([k.item() for k in kls]) if kls else 0
+
+    average_generated_tokens = np.mean([
+        len(completion) - prompt_token_counts[i % len(prompt_token_counts)]
+        for i, completion in enumerate(all_inputs)
+    ]) if all_inputs else 0
+
+    clip_ratio_low = clipped_low_count / max(total_comparisons, 1)
+    clip_ratio_high = clipped_high_count / max(total_comparisons, 1)
+    clip_ratio_total = (clipped_low_count + clipped_high_count) / max(total_comparisons, 1)
 
     metrics = {
-        "total_rewards_mean": mx.mean(rewards),
-        "total_rewards_std": mx.std(rewards),
-        "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
-        "grouped_rewards_std": mx.mean(grouped_rewards_std),
-        "kl": mean_kl,
-        "average_generated_tokens": len(all_completion_texts) // len(batch_indices),
-        "clip_ratio_low": (
-            (is_low_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
-        ),
-        "clip_ratio_high": (
-            (is_high_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
-        ),
-        "clip_ratio_total": (
-            (is_region_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
-        ),
-        **reward_metrics,
+        "total_rewards_mean": total_rewards_mean,
+        "total_rewards_std": total_rewards_std,
+        "grouped_rewards_mean": grouped_rewards_mean,
+        "grouped_rewards_std": grouped_rewards_std,
+        "kl": kl_mean,
+        "average_generated_tokens": average_generated_tokens,
+        "clip_ratio_low": clip_ratio_low,
+        "clip_ratio_high": clip_ratio_high,
+        "clip_ratio_total": clip_ratio_total,
     }
 
-    mx.clear_cache()
+    # Add per-reward function metrics
+    for func_name, rewards in reward_details.items():
+        if rewards:
+            metrics[f"{func_name}_mean"] = np.mean(rewards)
+            metrics[f"{func_name}_std"] = np.std(rewards)
+            metrics[f"{func_name}_coverage"] = np.mean([1 if r > 0 else 0 for r in rewards])
 
-    return loss, length_mask.sum(axis=1).sum(), metrics
+    return avg_loss, ntokens, metrics
+
+
 
 
 def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
     has_types = isinstance(dataset[0], tuple) and len(dataset[0]) == 5
 
-    if (
-        not dataset
-        or not isinstance(dataset[0], tuple)
-        or (not has_types and len(dataset[0]) != 4)
-    ):
+    if not dataset or not isinstance(dataset[0], tuple) or (not has_types and len(dataset[0]) != 4):
         raise ValueError(
             "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples"
         )
@@ -554,48 +538,45 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
             break
 
 
+
+
+
 def evaluate_grpo(
-    model: nn.Module,
-    ref_model: Optional[nn.Module],
+    model,
     dataset,
+    loss_fn,
+    ref_model,
+    reward_funcs,
     tokenizer,
+    group_size,
     batch_size,
     num_batches,
-    beta: float,
-    epsilon: float,
-    epsilon_high: float,
-    group_size: int,
-    max_seq_length: int,
-    max_tokens: int,
-    temperature: float,
-    reward_funcs: Optional[List[RewardFunctions]] = [
-        r1_accuracy_reward_func,
-        r1_int_reward_func,
-        r1_strict_format_reward_func,
-        r1_soft_format_reward_func,
-        r1_count_xml,
-    ],
-    loss_fn: callable = grpo_loss,
-    iterate_batches: callable = iterate_grpo_batches,
-    grpo_loss_type: str = "grpo",
-    importance_sampling_level: str = "token",
+    max_seq_length,
+    max_tokens,
+    beta,
+    epsilon,
+    epsilon_high,
+    temperature,
+    iterate_batches,
+    grpo_loss_type="grpo",
+    use_answer_tags=False,
 ):
-    all_losses = 0
+    model.eval()
+    all_losses = mx.array(0.0)
     ntokens = 0
-    all_metrics = None
+    accumulated_metrics = {}
 
-    index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
-
-    for _, batch in zip(
-        index_iterator,
-        iterate_batches(
+    for _ in range(num_batches):
+        batch = next(iterate_batches(
             dataset=dataset,
             batch_size=batch_size,
             max_seq_length=max_seq_length,
-        ),
-    ):
-        losses, toks, metrics = loss_fn(
+            train=False,
+        ))
+
+        loss, toks, metrics = loss_fn(
             model=model,
+            ref_model=ref_model,
             tokenizer=tokenizer,
             batch=batch,
             reward_funcs=reward_funcs,
@@ -603,29 +584,22 @@ def evaluate_grpo(
             group_size=group_size,
             epsilon=epsilon,
             epsilon_high=epsilon_high,
-            ref_model=ref_model,
-            temperature=temperature,
             max_tokens=max_tokens,
-            importance_sampling_level=importance_sampling_level,
+            temperature=temperature,
+            batch_size=batch_size,
             grpo_loss_type=grpo_loss_type,
+            use_answer_tags=use_answer_tags,
         )
 
-        all_losses += losses * toks
+        all_losses += loss * toks
         ntokens += toks
 
-        if all_metrics is None:
-            all_metrics = {k: v * toks for k, v in metrics.items()}
-        else:
-            for k, v in metrics.items():
-                all_metrics[k] += v * toks
+        for k, v in metrics.items():
+            if k not in accumulated_metrics:
+                accumulated_metrics[k] = 0
+            accumulated_metrics[k] += v
 
-        mx.eval(all_losses, ntokens)
-
-    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-    all_metrics = {k: mx.distributed.all_sum(v) for k, v in all_metrics.items()}
-
-    avg_metrics = {k: (v / ntokens).item() for k, v in all_metrics.items()}
+    avg_metrics = {k: v / num_batches for k, v in accumulated_metrics.items()}
     avg_loss = (all_losses / ntokens).item()
 
     return avg_loss, ntokens, avg_metrics
@@ -638,18 +612,15 @@ def train_grpo(
     optimizer,
     train_dataset,
     val_dataset,
-    reward_funcs: Optional[List[RewardFunctions]] = [
-        r1_accuracy_reward_func,
-        r1_int_reward_func,
-        r1_strict_format_reward_func,
-        r1_soft_format_reward_func,
-        r1_count_xml,
-    ],
+    reward_funcs: Optional[List[RewardFunctions]] = None,
     args: GRPOTrainingArgs = GRPOTrainingArgs(),
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
     training_callback: TrainingCallback = None,
 ):
+    """
+    Train a model using GRPO with optional answer tags.
+    """
     mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
     tqdm.write(f"Starting training..., iters: {args.iters}")
     world = mx.distributed.init()
@@ -661,10 +632,23 @@ def train_grpo(
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
 
+    # Use default reward functions if none provided
+    if reward_funcs is None:
+        reward_funcs = [
+            r1_accuracy_reward_func,
+            r1_int_reward_func,
+            r1_strict_format_reward_func,
+            r1_soft_format_reward_func,
+            r1_count_xml,
+        ]
+
     state = [model.state, optimizer.state]
 
     def step(batch):
         prompt_tokens, targets, prompt_lens, target_lens, type_info = batch
+
+        # Determine end_token based on use_answer_tags setting
+        end_token = "</answer>" if args.use_answer_tags else None
 
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
@@ -674,6 +658,8 @@ def train_grpo(
             group_size=args.group_size,
             temperature=args.temperature,
             batch_size=args.batch_size,
+            end_token=end_token,
+            stop_at_think_close=not args.use_answer_tags,
         )
 
         mx.clear_cache()
@@ -694,6 +680,7 @@ def train_grpo(
             grpo_loss_type=args.grpo_loss_type,
             max_tokens=args.max_completion_length,
             importance_sampling_level=args.importance_sampling_level,
+            use_answer_tags=args.use_answer_tags,
         )
 
         if (it + 1) % args.gradient_accumulation_steps == 0:
@@ -714,7 +701,7 @@ def train_grpo(
         "grouped_rewards_mean": 0,
         "grouped_rewards_std": 0,
         "kl": 0,
-        "average_generated_tokens": 0,
+        'average_generated_tokens': 0,
         "clip_ratio_low": 0,
         "clip_ratio_high": 0,
         "clip_ratio_total": 0,
@@ -728,14 +715,12 @@ def train_grpo(
     start = time.perf_counter()
     pbar = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
     for it in pbar:
-        batch = next(
-            iterate_batches(
-                dataset=train_dataset,
-                batch_size=args.batch_size,
-                max_seq_length=args.max_seq_length,
-                train=True,
-            )
-        )
+        batch = next(iterate_batches(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            max_seq_length=args.max_seq_length,
+            train=True,
+        ))
 
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             stop = time.perf_counter()
@@ -757,6 +742,7 @@ def train_grpo(
                 temperature=args.temperature,
                 iterate_batches=iterate_batches,
                 grpo_loss_type=args.grpo_loss_type,
+                use_answer_tags=args.use_answer_tags,
             )
             val_time = time.perf_counter() - stop
             if rank == 0:
@@ -801,12 +787,10 @@ def train_grpo(
             peak_mem = mx.get_peak_memory() / 1e9
 
             if rank == 0:
-                pbar.set_postfix(
-                    {
-                        "loss": f"{train_loss:.3f}",
-                        "it/s": f"{it_sec:.3f}",
-                    }
-                )
+                pbar.set_postfix({
+                    'loss': f"{train_loss:.3f}",
+                    'it/s': f"{it_sec:.3f}",
+                })
                 tqdm.write(
                     f"\nIter {it}: "
                     f"loss {train_loss:.3f}, "

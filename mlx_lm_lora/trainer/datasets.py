@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Union, Tuple
+from typing import Any, Dict, List, Union, Tuple, Optional
 from pathlib import Path
 import types
 import json
@@ -15,23 +15,48 @@ class GRPODataset:
         answer_key: str = "answer",
         system_key: str = "system",
         type_key: str = "type",
+        use_answer_tags: Optional[bool] = False,  # New optional parameter
     ):
         self._data = []
         for item in data:
             prompt_str = str(item[prompt_key])
             answer_str = str(item[answer_key])
             type_info = item.get(type_key, None)
-            default_system_str = "You are given a problem. Think about the problem and provide your working out. Place it between <think> and </think>. Then, provide your solution between <answer> </answer>."
-            system_str = item.get(system_key, default_system_str)
+
+            # Backward compatible: check if system prompt indicates answer tag preference
+            if system_key in item:
+                system_str = item[system_key]
+                # Auto-detect if the system prompt expects answer tags
+                if use_answer_tags is None:
+                    use_answer_tags = (
+                        "<answer>" in system_str and "</answer>" in system_str
+                    )
+            else:
+                # Default system prompts based on use_answer_tags parameter
+                if use_answer_tags is None:
+                    # Default to True for backward compatibility
+                    use_answer_tags = True
+
+                if use_answer_tags:
+                    # Original default (backward compatible)
+                    default_system_str = "You are given a problem. Think about the problem and provide your working out. Place it between <think> and </think>. Then, provide your solution between <answer> </answer>."
+                else:
+                    # New default for optional answer tags
+                    default_system_str = "You are given a problem. Think about the problem and provide your working out. Place it between <think> and </think>. Then, provide your solution."
+
+                system_str = item.get(system_key, default_system_str)
+
             prompt_tokens = tokenizer.apply_chat_template(
                 [
-                    {'role': 'system', 'content': system_str},
-                    {'role': 'user', 'content': prompt_str}
+                    {"role": "system", "content": system_str},
+                    {"role": "user", "content": prompt_str},
                 ],
-                add_generation_prompt=True
+                add_generation_prompt=True,
             )
             answer_tokens = tokenizer.encode(answer_str)
-            self._data.append((prompt_tokens, answer_tokens, prompt_str, answer_str, type_info))
+            self._data.append(
+                (prompt_tokens, answer_tokens, prompt_str, answer_str, type_info)
+            )
 
     def __getitem__(self, idx: int) -> Tuple[List[int], List[int], str, str]:
         return self._data[idx]
@@ -56,7 +81,7 @@ class PreferenceDataset:
 
         for d in data:
             self._chosen_data.append(tokenizer.encode(d[chosen_key]))
-            self._rejected_data.append(tokenizer.encode(rejected_key))
+            self._rejected_data.append(tokenizer.encode(d[rejected_key]))  # Fixed typo
 
     def __getitem__(self, idx: int):
         return {"chosen": self._chosen_data[idx], "rejected": self._rejected_data[idx]}
@@ -66,7 +91,7 @@ class PreferenceDataset:
 
     def process(self, d):
         return d
-    
+
 
 class PromptDataset:
     def __init__(
@@ -81,7 +106,14 @@ class PromptDataset:
 
     def process(self, d):
         messages = d[self.chat_key]
-        return {"prompt": self.tokenizer.apply_chat_template(messages, add_generation_prompt=True), "prompt_text": self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)}
+        return {
+            "prompt": self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True
+            ),
+            "prompt_text": self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            ),
+        }
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -119,8 +151,16 @@ class DPODataset:
                 {"role": "assistant", "content": d[rejected_key]}
             ]
 
-            self._chosen_data.append(tokenizer.apply_chat_template(chosen_messages, add_generation_prompt=True))
-            self._rejected_data.append(tokenizer.apply_chat_template(rejected_messages, add_generation_prompt=True))
+            self._chosen_data.append(
+                tokenizer.apply_chat_template(
+                    chosen_messages, add_generation_prompt=True
+                )
+            )
+            self._rejected_data.append(
+                tokenizer.apply_chat_template(
+                    rejected_messages, add_generation_prompt=True
+                )
+            )
 
     def __getitem__(self, idx: int):
         return {"chosen": self._chosen_data[idx], "rejected": self._rejected_data[idx]}
@@ -130,7 +170,7 @@ class DPODataset:
 
     def process(self, d):
         return d
-    
+
 
 class ORPODataset:
     def __init__(
@@ -193,8 +233,12 @@ class ORPODataset:
                 elif isinstance(d[rejected_key], list):
                     rejected_messages.extend(d[rejected_key])
 
-                chosen_text = tokenizer.apply_chat_template(chosen_messages, add_generation_prompt=True)
-                rejected_text = tokenizer.apply_chat_template(rejected_messages, add_generation_prompt=True)
+                chosen_text = tokenizer.apply_chat_template(
+                    chosen_messages, add_generation_prompt=True
+                )
+                rejected_text = tokenizer.apply_chat_template(
+                    rejected_messages, add_generation_prompt=True
+                )
 
             else:
                 chosen_content = self._extract_content(d[chosen_key])
@@ -413,17 +457,20 @@ def create_dataset(
     text_feature = getattr(config, "text_feature", "text")
     chat_feature = getattr(config, "chat_feature", "messages")
     prompt_feature = getattr(config, "prompt_feature", "prompt")
-    completion_feature = getattr(config, "completion_feature", "completion")
+    completion_feature = getattr(config, "completion_feature", "answer")
 
     # For ORPO and DPO
     system_feature = getattr(config, "system_feature", "system")
     chosen_feature = getattr(config, "chosen_feature", "chosen")
     rejected_feature = getattr(config, "rejected_feature", "rejected")
-    preference_score_feature = getattr(config, "preference_score_feature", "preference_score")
+    preference_score_feature = getattr(
+        config, "preference_score_feature", "preference_score"
+    )
 
     # For GRPO
     type_feature = getattr(config, "type_feature", "type")
     answer_feature = getattr(config, "answer_feature", "answer")
+    use_answer_tags = getattr(config, "use_answer_tags", False)  # New optional config
 
     sample = data[0]
 
@@ -436,7 +483,7 @@ def create_dataset(
                 prompt_key=prompt_feature,
                 chosen_key=chosen_feature,
                 rejected_key=rejected_feature,
-                preference_score_key=preference_score_feature
+                preference_score_key=preference_score_feature,
             )
         else:
             raise ValueError("Unsupported data format for ORPO training.")
@@ -448,8 +495,8 @@ def create_dataset(
                 prompt_key=prompt_feature,
                 system_key=system_feature,
                 chosen_key=chosen_feature,
-                rejected_key=rejected_feature
-                )
+                rejected_key=rejected_feature,
+            )
         else:
             raise ValueError("Unsupported data format for Online DPO or CPO training.")
     elif train_mode in ["online_dpo", "xpo", "rlhf"]:
@@ -470,10 +517,12 @@ def create_dataset(
                 answer_key=answer_feature,
                 system_key=system_feature,
                 type_key=type_feature,
+                use_answer_tags=use_answer_tags,  # Pass the optional parameter
             )
         else:
             raise ValueError("Unsupported data format for Online GRPO training.")
     elif train_mode in ["sft", "phi_ppo"]:
+        # Import these classes if not already present
         if prompt_feature in sample and completion_feature in sample:
             return CompletionsDataset(
                 data, tokenizer, prompt_feature, completion_feature, mask_prompt
