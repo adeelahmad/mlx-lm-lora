@@ -12,7 +12,7 @@ import mlx.optimizers as optim
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.tokenizer_utils import load_tokenizer
+from mlx_lm.tokenizer_utils import load as load_tokenizer
 from mlx_lm.tuner.callbacks import WandBCallback
 from mlx_lm.utils import load, save_config
 from mlx_optimizers import QHAdam
@@ -100,7 +100,7 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "lr_schedule": None,
-    "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
+    "lora_parameters": {"rank": 16, "dropout": 0.05, "scale": 40.0},
     "mask_prompt": False,
     "fuse": True,
     # ORPO args
@@ -474,6 +474,15 @@ def train_model(
             l.unfreeze()
     elif args.train_type in ["lora", "dora"]:
         # Convert linear layers to lora/dora layers and unfreeze in the process
+        args.lora_parameters = {"rank": 16, "dropout": 0.05, "scale": 40.0}
+        # Optimized for GRPO speed and Rank 64 stability
+        args.lora_parameters = {
+            "rank": 64,
+            "alpha": 128,    # Standard 2x rank scaling
+            "dropout": 0.0,  # CRITICAL: Set to 0.0 to enable fast kernels/Unsloth speedups
+            "scale": 2.0     # Mathematically: alpha / rank
+        }
+
         linear_to_lora_layers(
             model,
             args.num_layers,
@@ -792,6 +801,8 @@ def train_model(
             ),
             importance_sampling_level=args.importance_sampling_level,
             grpo_loss_type=args.grpo_loss_type,
+            seed=args.seed,
+            wandb_run_name = f"run_{args.seed})" or f"grpo_{time.strftime('%Y%m%d_%H%M%S')}"
         )
 
         print("Loading pretrained reference model")
@@ -1011,8 +1022,10 @@ def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
 
     if args.wandb is not None:
+
         training_callback = WandBCallback(
             project_name=args.wandb,
+
             log_dir=args.adapter_path,
             config=vars(args),
             wrapped_callback=training_callback,

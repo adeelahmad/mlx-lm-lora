@@ -4,11 +4,13 @@ from pathlib import Path
 from mlx.utils import tree_flatten, tree_unflatten
 
 from mlx_lm.gguf import convert_to_gguf
-from mlx_lm.tuner.utils import dequantize, load_adapters, linear_to_lora_layers
+from mlx_lm.tuner.utils import linear_to_lora_layers
 from mlx_lm.utils import (
     save_model,
     save_config,
     load,
+    dequantize_model as dequantize,
+    load_adapters,
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
