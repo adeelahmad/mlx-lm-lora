@@ -1,4 +1,5 @@
 """
+Path: mlx_lm_lora/train.py
 MLX-LM Training Script
 ======================
 Unified training script supporting multiple training modes:
@@ -406,25 +407,25 @@ def build_parser():
         "--lora-rank",
         type=int,
         help="LoRA rank parameter.",
-        default=128,
+        default=32,
     )
     parser.add_argument(
         "--lora-alpha",
         type=int,
         help="LoRA alpha parameter (typically 2x rank).",
-        default=256,
+        default=64,
     )
     parser.add_argument(
         "--lora-dropout",
         type=float,
         help="LoRA dropout (0.0 enables fast kernels).",
-        default=0.0,
+        default=0.01,
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         help="LoRA scale (alpha / rank).",
-        default=2,
+        default=0,
     )
 
     # ORPO args
@@ -557,19 +558,19 @@ def build_parser():
         "--phased-thinking-max-tokens",
         type=int,
         help="Max tokens for thinking phase.",
-        default=260,
+        default=90,
     )
     parser.add_argument(
         "--phased-answer-max-tokens",
         type=int,
         help="Max tokens for answer phase.",
-        default=None,
+        default=256,
     )
     parser.add_argument(
         "--phased-min-thinking-tokens",
         type=int,
         help="Minimum tokens before allowing </think>.",
-        default=50,
+        default=10,
     )
 
     # GRPO BiasedSampler (legacy)
@@ -585,13 +586,13 @@ def build_parser():
         "--top-p",
         type=float,
         help="Top-p sampling parameter.",
-        default=0.95,
+        default=0.8,
     )
     parser.add_argument(
         "--top-k",
         type=int,
         help="Top-k sampling parameter.",
-        default=20,
+        default=30,
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -629,7 +630,7 @@ def build_parser():
     parser.add_argument(
         "--actor-sync-frequency",
         type=int,
-        default=10,
+        default=3,
         help="Sync weights every N training steps.",
     )
     parser.add_argument(
@@ -1034,21 +1035,21 @@ def train_model(
             # Phased generation
             use_phased_generation=getattr(args, 'use_phased_generation', False),
             generation_phases=getattr(args, 'generation_phases', None),
-            phased_thinking_max_tokens=getattr(args, 'phased_thinking_max_tokens', 1500),
-            phased_answer_max_tokens=getattr(args, 'phased_answer_max_tokens', 500),
-            phased_min_thinking_tokens=getattr(args, 'phased_min_thinking_tokens', 50),
-            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.7),
-            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.5),
-            phased_verbose=getattr(args, 'phased_verbose', False),
+            phased_thinking_max_tokens=getattr(args, 'phased_thinking_max_tokens', 90),
+            phased_answer_max_tokens=getattr(args, 'phased_answer_max_tokens', 128),
+            phased_min_thinking_tokens=getattr(args, 'phased_min_thinking_tokens', 20),
+            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.8),
+            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.3),
+            phased_verbose=getattr(args, 'phased_verbose', True),
             # BiasedSampler (legacy)
-            use_biased_sampler=getattr(args, 'use_biased_sampler', False),
+            use_biased_sampler=getattr(args, 'use_biased_sampler', True),
             min_think_tokens=getattr(args, 'min_think_tokens', 50),
             max_think_tokens=getattr(args, 'max_think_tokens', 120),
             think_close_bias_start=getattr(args, 'think_close_bias_start', 5),
             think_close_bias_value=getattr(args, 'think_close_bias_value', 26.0),
             think_close_bias_decay=getattr(args, 'think_close_bias_decay', 0.095),
             force_close_after=getattr(args, 'force_close_after', 220),
-            sampler_verbose=getattr(args, 'sampler_verbose', False),
+            sampler_verbose=getattr(args, 'sampler_verbose', True),
             # Tracking
             track_diversity=getattr(args, 'track_diversity', True),
             track_kl_spikes=getattr(args, 'track_kl_spikes', True),
@@ -1074,15 +1075,15 @@ def train_model(
             ),
             actor_kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
             actor_sync_mode=getattr(args, 'actor_sync_mode', 'main_to_actors'),
-            actor_sync_frequency=getattr(args, 'actor_sync_frequency', 10),
-            lazy_load_actors=getattr(args, 'lazy_load_actors', False),
+            actor_sync_frequency=getattr(args, 'actor_sync_frequency', 3),
+            lazy_load_actors=getattr(args, 'lazy_load_actors', True),
             actor_temperature_offsets=(
                 [float(t.strip()) for t in args.actor_temperature_offsets.split(",")]
                 if getattr(args, 'actor_temperature_offsets', None)
                 else None
             ),
             actor_verbose=getattr(args, 'actor_verbose', True),
-            actor_update_references_frequency=getattr(args, 'actor_update_references_frequency', 50),
+            actor_update_references_frequency=getattr(args, 'actor_update_references_frequency', 10),
         )
 
         print("Loading pretrained reference model")

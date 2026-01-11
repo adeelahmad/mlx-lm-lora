@@ -1,4 +1,5 @@
 """
+Path: mlx_lm_lora/trainer/grpo_trainer.py
 GRPO Trainer - HYBRID PROFESSIONAL IMPLEMENTATION + MULTI-ACTOR
 ================================================================
 Masterfully crafted implementation combining proven architecture with advanced features.
@@ -11,7 +12,7 @@ Architecture Philosophy:
 - Professional logging and monitoring
 - Multi-Actor diverse policy exploration (NEW)
 
-Version: 5.0.0 - MULTI-ACTOR EDITION
+Version: 5.1.0 - MEMORY-EFFICIENT MULTI-ACTOR EDITION
 Author: Synthesis of battle-tested production code + cutting-edge optimizations
 Last Updated: 2025-01-12
 
@@ -29,11 +30,12 @@ Features:
 ✅ Professional documentation throughout
 
 Multi-Actor Features:
-✅ Multiple quantized actors for diverse rollouts
-✅ KL alignment to main actor (semantic coherence)
-✅ Three sync modes: main_to_actors, actors_to_main, bidirectional
-✅ Lazy loading for memory-constrained environments
-✅ Comprehensive WandB tracking per-actor
+✅ Memory-efficient sequential processing (one actor in memory at a time)
+✅ Load actor → Generate → Compute gradients → Accumulate → Unload
+✅ Averaged gradients applied to main model
+✅ Per-actor temperature offsets for exploration diversity
+✅ Comprehensive per-actor statistics and WandB tracking
+✅ Enhanced sample logging with actor details, individual rewards
 ✅ Graceful fallback to single-actor mode
 
 Performance:
@@ -59,6 +61,7 @@ import json
 import logging
 import threading
 import copy
+from pprint import pprint
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from functools import partial
@@ -69,16 +72,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from mlx_lm.generate import batch_generate, generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models import cache as mlx_cache
-from mlx_lm.models.cache import (
-    KVCache,
-    QuantizedKVCache,
-    RotatingKVCache,
-    load_prompt_cache,
-)
 from mlx_lm.tuner.callbacks import TrainingCallback
 from tqdm import tqdm
 
@@ -1018,10 +1015,10 @@ class GRPOTrainingArgs(SFTTrainingArgs):
     )
 
     lazy_load_actors: bool = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "Load/unload actors on demand to save memory. "
-                    "Slower but allows more actors on limited VRAM."
+            "help": "[DEPRECATED] Multi-actor is now always memory-efficient. "
+                    "Only one actor is loaded at a time by default."
         }
     )
 
@@ -1040,7 +1037,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     actor_update_references_frequency: int = field(
         default=50,
-        metadata={"help": "Update actor frozen references every N steps."}
+        metadata={"help": "[DEPRECATED] No longer needed - actors are fresh clones each step."}
     )
 
 
@@ -1346,16 +1343,19 @@ class MultiActorGRPO:
     """
     Multi-Actor GRPO Manager for diverse policy exploration.
 
-    Each actor generates rollouts independently, gradients are averaged
-    and applied to the main actor.
+    TRUE Memory-Efficient Sequential Processing:
+        For each actor:
+            1. Load actor (clone from main)
+            2. Generate rollouts
+            3. Compute rewards/advantages
+            4. Compute gradients on actor
+            5. Accumulate gradients
+            6. Unload actor (free memory)
+        Finally:
+            7. Average accumulated gradients
+            8. Apply to main model
 
-    Loss for each actor:
-        L_i = Policy_Loss + β * KL(actor_i || ref_i) + γ * KL(actor_i || main)
-
-    Sync modes:
-        - main_to_actors: Actors track main's learning (default)
-        - actors_to_main: Federated averaging to main
-        - bidirectional: Both directions
+    Only ONE actor is ever in memory at a time.
     """
 
     def __init__(
@@ -1365,7 +1365,6 @@ class MultiActorGRPO:
         model_path: str,
         tokenizer=None,
         lora_params: Optional[Dict[str, Any]] = None,
-        lazy_load: bool = False,
         sync_mode: str = "main_to_actors",
         kl_to_main_weight: float = 0.1,
         sync_frequency: int = 10,
@@ -1375,7 +1374,6 @@ class MultiActorGRPO:
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.lora_params = lora_params
-        self.lazy_load = lazy_load
         self.sync_mode = sync_mode
         self.kl_to_main_weight = kl_to_main_weight
         self.sync_frequency = sync_frequency
@@ -1386,92 +1384,69 @@ class MultiActorGRPO:
             raise ValueError(f"sync_mode must be one of {valid_modes}, got {sync_mode}")
 
         self.actor_configs = actor_configs
-        self.actors: List[ActorState] = []
 
-        if not lazy_load:
-            self._load_all_actors()
-        else:
-            self._current_loaded_idx: Optional[int] = None
+        # Statistics per actor (persisted even when actor is unloaded)
+        self.actor_stats: Dict[str, Dict[str, Any]] = {
+            config.name: {
+                "generation_count": 0,
+                "total_tokens": 0,
+                "mean_reward": 0.0,
+                "mean_kl": 0.0,
+                "mean_loss": 0.0,
+                "last_rewards": [],
+                "quantization": config.quantization or "full",
+                "temperature_offset": config.temperature_offset,
+            }
+            for config in actor_configs
+        }
+
+        # Current loaded actor (only one at a time for memory efficiency)
+        self._current_actor: Optional[nn.Module] = None
+        self._current_config: Optional[ActorConfig] = None
+
+        # Accumulated gradients (stored between actor iterations)
+        self._accumulated_grads: Optional[Dict[str, mx.array]] = None
+        self._grad_count: int = 0
+
+        # Accumulated metrics for logging
+        self._accumulated_completions: List[str] = []
+        self._accumulated_metadata: List[Dict[str, Any]] = []
+        self._accumulated_rewards: List[float] = []
 
         self.total_sync_count = 0
         self.step_count = 0
 
         if verbose:
-            logger.info(f"MultiActorGRPO initialized: {len(actor_configs)} actors, sync_mode={sync_mode}")
+            tqdm.write(f"[MultiActor] Initialized: {len(actor_configs)} actors, memory_efficient=True")
+            for cfg in actor_configs:
+                tqdm.write(f"  • {cfg.name}: {cfg.quantization or 'full'}, temp_offset={cfg.temperature_offset:+.2f}")
 
-    def _load_all_actors(self):
-        """Load all actors into memory."""
-        for config in self.actor_configs:
-            actor_state = self._create_actor(config)
-            self.actors.append(actor_state)
-            if self.verbose:
-                tqdm.write(f"  Loaded actor: {config.name} ({config.quantization or 'full'})")
+    def _load_actor(self, config: ActorConfig) -> nn.Module:
+        """Load a single actor (clone from main with current weights)."""
+        # Ensure previous actor is unloaded
+        self._unload_current_actor()
 
-    def _create_actor(self, config: ActorConfig) -> ActorState:
-        """Create a single actor with its frozen reference."""
-        actor_model = self._clone_model(self.main_actor)
-        reference = self._clone_model(actor_model)
-        reference.freeze()
+        actor = copy.deepcopy(self.main_actor)
+        actor.train()
+        self._current_actor = actor
+        self._current_config = config
 
-        return ActorState(
-            config=config,
-            model=actor_model,
-            reference=reference,
-            is_loaded=True,
-        )
+        if self.verbose:
+            tqdm.write(f"    [MultiActor] Loaded: {config.name}")
 
-    def _clone_model(self, model: nn.Module) -> nn.Module:
-        """Create a deep copy of model weights."""
-        params = dict(tree_flatten(model.parameters()))
-        new_params = {k: mx.array(v) for k, v in params.items()}
-        new_model = copy.deepcopy(model)
-        new_model.load_weights(list(new_params.items()))
-        return new_model
+        return actor
 
-    def _sync_weights_to_actor(self, actor: nn.Module):
-        """Sync trainable weights from main actor to sub-actor."""
-        main_params = dict(tree_flatten(self.main_actor.trainable_parameters()))
-        actor.load_weights(list(main_params.items()))
-
-    def _average_weights(self, actors: List[nn.Module]) -> Dict[str, mx.array]:
-        """Average trainable weights across actors."""
-        if not actors:
-            return {}
-        all_params = [dict(tree_flatten(a.trainable_parameters())) for a in actors]
-        param_names = list(all_params[0].keys())
-        averaged = {}
-        for name in param_names:
-            stacked = mx.stack([p[name] for p in all_params])
-            averaged[name] = mx.mean(stacked, axis=0)
-        return averaged
-
-    def get_actor_for_generation(self, actor_idx: int) -> ActorState:
-        """Get an actor for generation, handling lazy loading if needed."""
-        if self.lazy_load:
-            if self._current_loaded_idx != actor_idx:
-                if self._current_loaded_idx is not None and self.actors:
-                    self._unload_actor(self._current_loaded_idx)
-                if actor_idx < len(self.actor_configs):
-                    config = self.actor_configs[actor_idx]
-                    actor_state = self._create_actor(config)
-                    if actor_idx < len(self.actors):
-                        self.actors[actor_idx] = actor_state
-                    else:
-                        self.actors.append(actor_state)
-                    self._current_loaded_idx = actor_idx
-            return self.actors[self._current_loaded_idx]
-        else:
-            return self.actors[actor_idx]
-
-    def _unload_actor(self, actor_idx: int):
-        """Unload an actor to free memory."""
-        if actor_idx < len(self.actors):
-            actor = self.actors[actor_idx]
-            actor.is_loaded = False
-            del actor.model
-            del actor.reference
+    def _unload_current_actor(self):
+        """Unload current actor to free memory."""
+        if self._current_actor is not None:
+            name = self._current_config.name if self._current_config else "unknown"
+            del self._current_actor
+            self._current_actor = None
+            self._current_config = None
             gc.collect()
             mx.clear_cache()
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] Unloaded: {name}")
 
     @property
     def num_actors(self) -> int:
@@ -1483,41 +1458,76 @@ class MultiActorGRPO:
         remainder = total_group_size % self.num_actors
         return [per_actor + (1 if i < remainder else 0) for i in range(self.num_actors)]
 
-    def sync_weights(self, force: bool = False):
-        """Sync weights according to configured sync_mode."""
+    def reset_accumulation(self):
+        """Reset gradient and metrics accumulation for new step."""
+        self._accumulated_grads = None
+        self._grad_count = 0
+        self._accumulated_completions = []
+        self._accumulated_metadata = []
+        self._accumulated_rewards = []
+
+    def accumulate_gradients(self, grads: Dict[str, mx.array]):
+        """Accumulate gradients from an actor."""
+        if self._accumulated_grads is None:
+            # First actor - just store
+            self._accumulated_grads = {k: mx.array(v) for k, v in grads.items()}
+        else:
+            # Add to existing
+            for k, v in grads.items():
+                if k in self._accumulated_grads:
+                    self._accumulated_grads[k] = self._accumulated_grads[k] + v
+                else:
+                    self._accumulated_grads[k] = mx.array(v)
+        self._grad_count += 1
+
+    def get_averaged_gradients(self) -> Optional[Dict[str, mx.array]]:
+        """Get averaged gradients across all actors."""
+        if self._accumulated_grads is None or self._grad_count == 0:
+            return None
+
+        # Average by number of actors
+        averaged = {
+            k: v / self._grad_count
+            for k, v in self._accumulated_grads.items()
+        }
+        return averaged
+
+    def accumulate_metrics(
+        self,
+        actor_name: str,
+        completions: List[str],
+        rewards: List[float],
+        metadata: List[Dict[str, Any]],
+        loss: float,
+        kl: float,
+    ):
+        """Accumulate metrics from an actor for logging."""
+        self._accumulated_completions.extend(completions)
+        self._accumulated_metadata.extend(metadata)
+        self._accumulated_rewards.extend(rewards)
+
+        # Update per-actor stats
+        stats = self.actor_stats[actor_name]
+        stats["generation_count"] += len(completions)
+        stats["total_tokens"] += sum(len(c) for c in completions)
+        stats["mean_reward"] = float(np.mean(rewards)) if rewards else 0.0
+        stats["mean_loss"] = loss
+        stats["mean_kl"] = kl
+        stats["last_rewards"] = rewards[-10:]  # Keep last 10
+
+    def get_accumulated_data(self) -> Tuple[List[str], List[Dict], List[float]]:
+        """Get all accumulated completions, metadata, and rewards."""
+        return (
+            self._accumulated_completions,
+            self._accumulated_metadata,
+            self._accumulated_rewards,
+        )
+
+    def sync_to_main(self):
+        """Track sync operations."""
         self.step_count += 1
-        if not force and self.step_count % self.sync_frequency != 0:
-            return
-
-        self.total_sync_count += 1
-
-        if self.sync_mode == "main_to_actors":
-            for actor_state in self.actors:
-                if actor_state.is_loaded:
-                    self._sync_weights_to_actor(actor_state.model)
-
-        elif self.sync_mode == "actors_to_main":
-            loaded_actors = [a.model for a in self.actors if a.is_loaded]
-            if loaded_actors:
-                averaged = self._average_weights(loaded_actors)
-                self.main_actor.load_weights(list(averaged.items()))
-
-        elif self.sync_mode == "bidirectional":
-            loaded_actors = [a.model for a in self.actors if a.is_loaded]
-            if loaded_actors:
-                averaged = self._average_weights(loaded_actors)
-                self.main_actor.load_weights(list(averaged.items()))
-            for actor_state in self.actors:
-                if actor_state.is_loaded:
-                    self._sync_weights_to_actor(actor_state.model)
-
-    def update_references(self):
-        """Update frozen references for all actors."""
-        for actor_state in self.actors:
-            if actor_state.is_loaded:
-                actor_params = dict(tree_flatten(actor_state.model.trainable_parameters()))
-                actor_state.reference.load_weights(list(actor_params.items()))
-                actor_state.reference.freeze()
+        if self.step_count % self.sync_frequency == 0:
+            self.total_sync_count += 1
 
     def get_wandb_metrics(self) -> Dict[str, Any]:
         """Get comprehensive metrics for WandB logging."""
@@ -1527,23 +1537,27 @@ class MultiActorGRPO:
             "multi_actor/step_count": self.step_count,
             "multi_actor/sync_mode": self.sync_mode,
             "multi_actor/kl_to_main_weight": self.kl_to_main_weight,
+            "multi_actor/memory_efficient": True,
+            "multi_actor/grad_accumulations": self._grad_count,
         }
-        for i, actor_state in enumerate(self.actors):
-            if actor_state.is_loaded:
-                prefix = f"actor/{actor_state.config.name}"
-                metrics[f"{prefix}/generation_count"] = actor_state.generation_count
-                metrics[f"{prefix}/total_tokens"] = actor_state.total_tokens_generated
-                metrics[f"{prefix}/mean_kl_to_ref"] = actor_state.mean_kl_to_ref
-                metrics[f"{prefix}/mean_kl_to_main"] = actor_state.mean_kl_to_main
-                metrics[f"{prefix}/mean_reward"] = actor_state.mean_reward
-                metrics[f"{prefix}/quantization"] = actor_state.config.quantization or "full"
+
+        for actor_name, stats in self.actor_stats.items():
+            prefix = f"actor/{actor_name}"
+            metrics[f"{prefix}/generation_count"] = stats["generation_count"]
+            metrics[f"{prefix}/total_tokens"] = stats["total_tokens"]
+            metrics[f"{prefix}/mean_reward"] = stats["mean_reward"]
+            metrics[f"{prefix}/mean_loss"] = stats["mean_loss"]
+            metrics[f"{prefix}/mean_kl"] = stats["mean_kl"]
+            metrics[f"{prefix}/quantization"] = stats["quantization"]
+            metrics[f"{prefix}/temp_offset"] = stats["temperature_offset"]
+
         return metrics
 
     def cleanup(self):
-        """Cleanup all actors and free memory."""
-        for i in range(len(self.actors)):
-            self._unload_actor(i)
-        self.actors.clear()
+        """Cleanup any loaded actor and accumulated data."""
+        self._unload_current_actor()
+        self._accumulated_grads = None
+        self._grad_count = 0
         gc.collect()
         mx.clear_cache()
 
@@ -1599,7 +1613,6 @@ def initialize_multi_actor(
         model_path=model_path,
         tokenizer=tokenizer,
         lora_params=lora_params,
-        lazy_load=getattr(args, 'lazy_load_actors', False),
         sync_mode=getattr(args, 'actor_sync_mode', 'main_to_actors'),
         kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
         sync_frequency=getattr(args, 'actor_sync_frequency', 10),
@@ -2606,6 +2619,8 @@ def calculate_rewards_and_advantages(
 
     # Calculate reward metrics
     reward_metrics: Dict[str, Any] = {}
+    individual_rewards: Dict[str, List[float]] = {}  # Store individual scores for logging
+
     for i, reward_func in enumerate(reward_funcs):
         func_name = reward_func.__name__
         raw_rewards = reward_func(
@@ -2614,6 +2629,13 @@ def calculate_rewards_and_advantages(
             answer=expanded_answers,
             types=expanded_types,
         )
+
+        # Store individual rewards for logging
+        individual_rewards[func_name] = [
+            float(r) if r is not None and not np.isnan(r) else None
+            for r in (raw_rewards or [None] * len(all_completion_texts))
+        ]
+
         valid_rewards = [
             float(r)
             for r in (raw_rewards or [])
@@ -2638,12 +2660,14 @@ def calculate_rewards_and_advantages(
         np.std(rewards) if len(rewards) > 1 else 0.0 for rewards in rewards_by_prompt
     ]
 
-    # Aggregate metrics
+    # Aggregate metrics (include total_rewards list and individual_rewards for logging)
     reward_specific_metrics = {
         "total_rewards_mean": float(mx.mean(combined_rewards)),
         "total_rewards_std": float(mx.std(combined_rewards)),
         "grouped_rewards_mean": float(np.mean(grouped_rewards_mean)),
         "grouped_rewards_std": float(np.mean(grouped_rewards_std)),
+        "total_rewards": [float(r) for r in combined_rewards.tolist()],  # For per-completion logging
+        "individual_rewards": individual_rewards,  # For per-completion logging
         **reward_metrics,
     }
 
@@ -2671,6 +2695,7 @@ def grpo_loss(
     iteration: int = 0,
     update_counter: int = 0,
     log_samples: bool = False,
+    actor_metadata: Optional[List[Dict[str, Any]]] = None,  # NEW: per-completion actor info
 ) -> Tuple[mx.array, mx.array, Dict[str, Any]]:
     """
     GRPO loss function with optional compilation.
@@ -2868,7 +2893,9 @@ def grpo_loss(
             if length_mask_sum > 0
             else 0.0
         ),
-        **reward_metrics,
+        # Only include numeric metrics from reward_metrics (skip lists/dicts)
+        **{k: v for k, v in (reward_metrics or {}).items()
+           if isinstance(v, (int, float)) and not isinstance(v, bool)},
     }
 
     # Log samples if requested
@@ -2880,11 +2907,16 @@ def grpo_loss(
             length_mask.sum(axis=1), 1.0
         )
 
+        # Get individual reward scores from reward_metrics
+        individual_rewards = reward_metrics.get("individual_rewards", {}) if reward_metrics else {}
+        total_rewards_list = reward_metrics.get("total_rewards", []) if reward_metrics else []
+
         for prompt_idx in unique_prompt_indices:
             prompt_completions = []
             prompt_rewards = []
             prompt_advantages_list = []
             prompt_kls = []
+            prompt_actors = []
 
             for i, idx in enumerate(batch_indices):
                 if idx == prompt_idx:
@@ -2892,32 +2924,74 @@ def grpo_loss(
                     comp_kl = float(per_seq_kl[i])
                     comp_length = len(completion_texts[i])
 
-                    prompt_completions.append(
-                        {
-                            "completion": completion_texts[i],
-                            "completion_length": comp_length,
-                            "advantage": comp_adv,
-                            "kl": comp_kl,
+                    # Get total reward for this completion
+                    comp_total_reward = total_rewards_list[i] if i < len(total_rewards_list) else None
+
+                    # Get individual reward scores
+                    comp_individual_rewards = {}
+                    for func_name, scores in individual_rewards.items():
+                        if i < len(scores) and scores[i] is not None:
+                            comp_individual_rewards[func_name] = float(scores[i])
+
+                    # Get actor info if available
+                    comp_actor_info = None
+                    if actor_metadata and i < len(actor_metadata):
+                        comp_actor_info = actor_metadata[i]
+                        if comp_actor_info:
+                            prompt_actors.append(comp_actor_info.get("actor_name", "unknown"))
+
+                    completion_entry = {
+                        "completion": completion_texts[i],
+                        "completion_length": comp_length,
+                        "advantage": comp_adv,
+                        "kl": comp_kl,
+                        "total_reward": comp_total_reward,
+                        "individual_rewards": comp_individual_rewards,
+                    }
+
+                    # Add actor info if present
+                    if comp_actor_info:
+                        completion_entry["actor"] = {
+                            "name": comp_actor_info.get("actor_name"),
+                            "quantization": comp_actor_info.get("actor_quantization"),
+                            "temperature": comp_actor_info.get("actor_temperature"),
+                            "temp_offset": comp_actor_info.get("actor_temp_offset"),
                         }
-                    )
-                    prompt_rewards.append(comp_adv)
+
+                    prompt_completions.append(completion_entry)
+                    prompt_rewards.append(comp_total_reward if comp_total_reward else comp_adv)
                     prompt_advantages_list.append(comp_adv)
                     prompt_kls.append(comp_kl)
 
             if prompt_completions:
                 group_stats = {
                     "advantage_mean": float(np.mean(prompt_advantages_list)),
-                    "advantage_std": float(np.std(prompt_advantages_list)),
+                    "advantage_std": float(np.std(prompt_advantages_list)) if len(prompt_advantages_list) > 1 else 0.0,
                     "kl_mean": float(np.mean(prompt_kls)),
                     "kl_max": float(np.max(prompt_kls)),
+                    "kl_min": float(np.min(prompt_kls)),
+                    "reward_mean": float(np.mean([r for r in prompt_rewards if r is not None])) if any(r is not None for r in prompt_rewards) else None,
+                    "reward_std": float(np.std([r for r in prompt_rewards if r is not None])) if len([r for r in prompt_rewards if r is not None]) > 1 else 0.0,
                 }
+
+                # Add actor distribution if multi-actor
+                if prompt_actors:
+                    from collections import Counter
+                    actor_counts = Counter(prompt_actors)
+                    group_stats["actor_distribution"] = dict(actor_counts)
+
+                # Get type info if available
+                type_info_val = None
+                if len(batch) > 4 and batch[4] is not None:
+                    type_info_val = batch[4][prompt_idx] if prompt_idx < len(batch[4]) else None
 
                 jsonl_logger.log(
                     {
                         "iteration": iteration,
                         "update": update_counter,
                         "prompt": prompt_text[prompt_idx],
-                        "answer": answer_text[prompt_idx],
+                        "expected_answer": answer_text[prompt_idx],
+                        "type": type_info_val,
                         "group_size": len(prompt_completions),
                         "completions": prompt_completions,
                         "group_stats": group_stats,
@@ -2925,6 +2999,7 @@ def grpo_loss(
                             "beta": beta,
                             "epsilon": epsilon,
                             "epsilon_high": epsilon_high_val,
+                            "grpo_loss_type": grpo_loss_type,
                         },
                     }
                 )
@@ -3192,10 +3267,16 @@ def evaluate_grpo(
         ntokens += int(toks)
 
         if all_metrics is None:
-            all_metrics = {k: float(v) * float(toks) for k, v in metrics.items()}
+            all_metrics = {}
+            for k, v in metrics.items():
+                # Skip non-numeric metrics (lists, dicts, etc.)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    all_metrics[k] = float(v) * float(toks)
         else:
             for k, v in metrics.items():
-                all_metrics[k] += float(v) * float(toks)
+                # Skip non-numeric metrics
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and k in all_metrics:
+                    all_metrics[k] += float(v) * float(toks)
 
     # Distributed reduction
     all_losses_arr = mx.array(all_losses)
@@ -3204,9 +3285,13 @@ def evaluate_grpo(
 
     all_losses_sum = mx.distributed.all_sum(all_losses_arr, stream=mx.cpu)
     ntokens_sum = mx.distributed.all_sum(ntokens_arr, stream=mx.cpu)
-    all_metrics_sum = {k: mx.distributed.all_sum(mx.array(v)) for k, v in all_metrics.items()}
 
-    avg_metrics = {k: float(v) / float(ntokens_sum) for k, v in all_metrics_sum.items()}
+    if all_metrics:
+        all_metrics_sum = {k: mx.distributed.all_sum(mx.array(v)) for k, v in all_metrics.items()}
+        avg_metrics = {k: float(v) / float(ntokens_sum) for k, v in all_metrics_sum.items()}
+    else:
+        avg_metrics = {}
+
     avg_loss = float(all_losses_sum) / float(ntokens_sum)
 
     return avg_loss, int(ntokens_sum), avg_metrics
@@ -3292,12 +3377,12 @@ def train_grpo(
         tqdm.write(f"✓ Sample Logging: {'ENABLED' if args.log_samples else 'DISABLED'}")
         tqdm.write(f"✓ WandB Logging: {'ENABLED' if args.use_wandb else 'DISABLED'}")
         if args.use_phased_generation:
-            tqdm.write(f"✓ Phased Generation: ENABLED")
+            tqdm.write("✓ Phased Generation: ENABLED")
             if generation_phases:
                 for phase in generation_phases:
                     tqdm.write(f"  - {phase.name}: max={phase.max_tokens}, temp={phase.temperature}")
         elif args.use_biased_sampler:
-            tqdm.write(f"✓ BiasedSampler: ENABLED (legacy)")
+            tqdm.write("✓ BiasedSampler: ENABLED (legacy)")
             tqdm.write(f"  - Min think: {args.min_think_tokens} tokens")
             tqdm.write(f"  - Max think: {args.max_think_tokens} tokens")
             tqdm.write(f"  - Force close: {args.force_close_after} tokens")
@@ -3372,7 +3457,7 @@ def train_grpo(
             lora_params=None,
         )
         if multi_actor and rank == 0:
-            tqdm.write(f"✓ Multi-Actor GRPO: ENABLED")
+            tqdm.write("✓ Multi-Actor GRPO: ENABLED")
             tqdm.write(f"  - Actors: {multi_actor.num_actors}")
             for config in multi_actor.actor_configs:
                 tqdm.write(f"    • {config.name}: {config.quantization or 'full'}, temp_offset={config.temperature_offset}")
@@ -3409,27 +3494,33 @@ def train_grpo(
         mx.clear_cache()
         prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
-        # Generate completions (multi-actor or single-actor)
-        actor_indices = None  # Track which actor generated each completion
-
+        # =====================================================================
+        # MULTI-ACTOR: Memory-efficient sequential gradient computation
+        # Load actor → Generate → Compute gradients → Accumulate → Unload
+        # =====================================================================
         if multi_actor:
-            # Multi-actor diverse generation
-            all_completions = []
-            all_completion_texts = []
-            batch_indices = []
-            actor_indices = []
+            multi_actor.reset_accumulation()
 
             distribution = multi_actor.distribute_group_size(args.group_size)
+            all_metrics = []
+            total_loss = 0.0
+            total_tokens = 0
+            all_actor_metadata = []
+            all_completion_texts_for_log = []
 
             for actor_idx, actor_group_size in enumerate(distribution):
                 if actor_group_size == 0:
                     continue
 
-                actor_state = multi_actor.get_actor_for_generation(actor_idx)
-                actor_temp = args.temperature + actor_state.config.temperature_offset
+                config = multi_actor.actor_configs[actor_idx]
+                actor_temp = args.temperature + config.temperature_offset
 
+                # 1. Load actor (clone from main)
+                actor = multi_actor._load_actor(config)
+
+                # 2. Generate from this actor
                 completions, completion_texts, batch_idx = generate_grpo(
-                    model=actor_state.model,
+                    model=actor,
                     tokenizer=tokenizer,
                     prompt_tokens=prompt_tokens,
                     max_tokens=args.max_completion_length,
@@ -3466,15 +3557,147 @@ def train_grpo(
                     update_idx=update_counter,
                 )
 
-                actor_indices.extend([actor_idx] * len(completions))
-                all_completions.extend(completions)
-                all_completion_texts.extend(completion_texts)
-                batch_indices.extend(batch_idx)
+                # Create actor metadata for logging
+                actor_metadata = [
+                    {
+                        "actor_name": config.name,
+                        "actor_idx": actor_idx,
+                        "actor_quantization": config.quantization or "full",
+                        "actor_temperature": actor_temp,
+                        "actor_temp_offset": config.temperature_offset,
+                        "completion_length": len(c),
+                    }
+                    for c in completions
+                ]
+                all_actor_metadata.extend(actor_metadata)
+                all_completion_texts_for_log.extend(completion_texts)
 
-                actor_state.generation_count += len(completions)
-                actor_state.total_tokens_generated += sum(len(c) for c in completions)
+                # 3. Prepare expanded data for this actor's completions
+                expanded_answers = []
+                expanded_prompts = []
+                expanded_types = []
+                unique_prompt_indices = sorted(set(batch_idx))
+                grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
+
+                for i, completion_idx in enumerate(batch_idx):
+                    grouped_completions[completion_idx].append(i)
+
+                ordered_completions = []
+                ordered_completion_texts = []
+                ordered_batch_indices = []
+                ordered_actor_metadata = []
+
+                for prompt_idx in unique_prompt_indices:
+                    completion_indices = grouped_completions[prompt_idx]
+                    for idx in completion_indices:
+                        ordered_completions.append(completions[idx])
+                        ordered_completion_texts.append(completion_texts[idx])
+                        ordered_batch_indices.append(prompt_idx)
+                        ordered_actor_metadata.append(actor_metadata[idx])
+                        expanded_answers.append(answer_text[prompt_idx])
+                        expanded_prompts.append(prompt_text[prompt_idx])
+                        expanded_types.append(
+                            type_info[prompt_idx] if type_info is not None else None
+                        )
+
+                # 4. Calculate rewards and advantages for this actor's completions
+                advantages, reward_metrics = calculate_rewards_and_advantages(
+                    reward_funcs=reward_funcs,
+                    expanded_prompts=expanded_prompts,
+                    all_completion_texts=ordered_completion_texts,
+                    expanded_answers=expanded_answers,
+                    expanded_types=expanded_types,
+                    batch_indices=ordered_batch_indices,
+                    unique_prompt_indices=unique_prompt_indices,
+                    reward_weights=args.reward_weights,
+                )
+
+                # 5. Compute gradients on this actor
+                actor_loss_value_and_grad = nn.value_and_grad(actor, loss_fn)
+
+                should_log = (
+                    args.log_samples
+                    and jsonl_logger is not None
+                    and iteration % args.log_samples_frequency == 0
+                    and actor_idx == 0  # Only log first actor's samples in detail
+                )
+
+                (lvalue, toks, metrics), actor_grad = actor_loss_value_and_grad(
+                    actor,
+                    batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
+                    completions=ordered_completions,
+                    completion_texts=ordered_completion_texts,
+                    batch_indices=ordered_batch_indices,
+                    advantages=advantages,
+                    reward_metrics=reward_metrics,
+                    beta=args.beta,
+                    epsilon=args.epsilon,
+                    epsilon_high=args.epsilon_high,
+                    ref_model=ref_model,
+                    grpo_loss_type=args.grpo_loss_type,
+                    importance_sampling_level=args.importance_sampling_level,
+                    max_tokens=args.max_completion_length,
+                    use_compilation=args.use_compilation,
+                    jsonl_logger=jsonl_logger,
+                    iteration=iteration,
+                    update_counter=update_counter,
+                    log_samples=should_log,
+                    actor_metadata=ordered_actor_metadata,
+                )
+
+                # 6. Accumulate gradients
+                actor_grad_flat = dict(tree_flatten(actor_grad))
+                multi_actor.accumulate_gradients(actor_grad_flat)
+
+                # Accumulate metrics
+                total_loss += float(lvalue)
+                total_tokens += int(toks)
+                all_metrics.append(metrics)
+
+                # Update actor stats
+                total_rewards = reward_metrics.get("total_rewards", [])
+                actor_kl = metrics.get("kl", 0.0)
+                multi_actor.accumulate_metrics(
+                    actor_name=config.name,
+                    completions=completion_texts,
+                    rewards=total_rewards if total_rewards else [0.0] * len(completion_texts),
+                    metadata=actor_metadata,
+                    loss=float(lvalue),
+                    kl=actor_kl,
+                )
+
+                # 7. Unload actor to free memory
+                del actor_grad, actor_loss_value_and_grad
+                del completions, completion_texts, ordered_completions
+                del advantages, reward_metrics
+                multi_actor._unload_current_actor()
+                mx.clear_cache()
+
+            # 8. Get averaged gradients
+            averaged_grads = multi_actor.get_averaged_gradients()
+            if averaged_grads:
+                grad = tree_unflatten(list(averaged_grads.items()))
+            else:
+                grad = None
+
+            # Average metrics
+            lvalue = total_loss / multi_actor.num_actors if multi_actor.num_actors > 0 else 0.0
+            toks = total_tokens
+
+            # Merge metrics from all actors
+            metrics = {}
+            if all_metrics:
+                for key in all_metrics[0].keys():
+                    values = [m.get(key, 0.0) for m in all_metrics if isinstance(m.get(key, 0), (int, float))]
+                    if values:
+                        metrics[key] = float(np.mean(values))
+
+            multi_actor.sync_to_main()
+
+        # =====================================================================
+        # SINGLE ACTOR: Standard GRPO (unchanged)
+        # =====================================================================
         else:
-            # Standard single-actor generation
             all_completions, all_completion_texts, batch_indices = generate_grpo(
                 model=model,
                 tokenizer=tokenizer,
@@ -3513,85 +3736,86 @@ def train_grpo(
                 update_idx=update_counter,
             )
 
-        # Prepare expanded data
-        expanded_answers = []
-        expanded_prompts = []
-        expanded_types = []
-        unique_prompt_indices = sorted(set(batch_indices))
-        grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
+            # Prepare expanded data
+            expanded_answers = []
+            expanded_prompts = []
+            expanded_types = []
+            unique_prompt_indices = sorted(set(batch_indices))
+            grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
 
-        for i, completion_idx in enumerate(batch_indices):
-            grouped_completions[completion_idx].append(i)
+            for i, completion_idx in enumerate(batch_indices):
+                grouped_completions[completion_idx].append(i)
 
-        ordered_completions = []
-        ordered_completion_texts = []
-        ordered_batch_indices = []
+            ordered_completions = []
+            ordered_completion_texts = []
+            ordered_batch_indices = []
 
-        for prompt_idx in unique_prompt_indices:
-            completion_indices = grouped_completions[prompt_idx]
-            for idx in completion_indices:
-                ordered_completions.append(all_completions[idx])
-                ordered_completion_texts.append(all_completion_texts[idx])
-                ordered_batch_indices.append(prompt_idx)
-                expanded_answers.append(answer_text[prompt_idx])
-                expanded_prompts.append(prompt_text[prompt_idx])
-                expanded_types.append(
-                    type_info[prompt_idx] if type_info is not None else None
-                )
+            for prompt_idx in unique_prompt_indices:
+                completion_indices = grouped_completions[prompt_idx]
+                for idx in completion_indices:
+                    ordered_completions.append(all_completions[idx])
+                    ordered_completion_texts.append(all_completion_texts[idx])
+                    ordered_batch_indices.append(prompt_idx)
+                    expanded_answers.append(answer_text[prompt_idx])
+                    expanded_prompts.append(prompt_text[prompt_idx])
+                    expanded_types.append(
+                        type_info[prompt_idx] if type_info is not None else None
+                    )
 
-        # Calculate rewards and advantages
-        advantages, reward_metrics = calculate_rewards_and_advantages(
-            reward_funcs=reward_funcs,
-            expanded_prompts=expanded_prompts,
-            all_completion_texts=ordered_completion_texts,
-            expanded_answers=expanded_answers,
-            expanded_types=expanded_types,
-            batch_indices=ordered_batch_indices,
-            unique_prompt_indices=unique_prompt_indices,
-            reward_weights=args.reward_weights,
-        )
+            # Calculate rewards and advantages
+            advantages, reward_metrics = calculate_rewards_and_advantages(
+                reward_funcs=reward_funcs,
+                expanded_prompts=expanded_prompts,
+                all_completion_texts=ordered_completion_texts,
+                expanded_answers=expanded_answers,
+                expanded_types=expanded_types,
+                batch_indices=ordered_batch_indices,
+                unique_prompt_indices=unique_prompt_indices,
+                reward_weights=args.reward_weights,
+            )
 
-        # Compute loss and gradients
-        should_log_samples = (
-            args.log_samples
-            and jsonl_logger is not None
-            and iteration % args.log_samples_frequency == 0
-        )
+            # Compute loss and gradients
+            should_log_samples = (
+                args.log_samples
+                and jsonl_logger is not None
+                and iteration % args.log_samples_frequency == 0
+            )
 
-        (lvalue, toks, metrics), grad = loss_value_and_grad(
-            model,
-            batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
-            completions=ordered_completions,
-            completion_texts=ordered_completion_texts,
-            batch_indices=ordered_batch_indices,
-            advantages=advantages,
-            reward_metrics=reward_metrics,
-            beta=args.beta,
-            epsilon=args.epsilon,
-            epsilon_high=args.epsilon_high,
-            ref_model=ref_model,
-            grpo_loss_type=args.grpo_loss_type,
-            importance_sampling_level=args.importance_sampling_level,
-            max_tokens=args.max_completion_length,
-            use_compilation=args.use_compilation,
-            jsonl_logger=jsonl_logger,
-            iteration=iteration,
-            update_counter=update_counter,
-            log_samples=should_log_samples,
-        )
+            (lvalue, toks, metrics), grad = loss_value_and_grad(
+                model,
+                batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
+                completions=ordered_completions,
+                completion_texts=ordered_completion_texts,
+                batch_indices=ordered_batch_indices,
+                advantages=advantages,
+                reward_metrics=reward_metrics,
+                beta=args.beta,
+                epsilon=args.epsilon,
+                epsilon_high=args.epsilon_high,
+                ref_model=ref_model,
+                grpo_loss_type=args.grpo_loss_type,
+                importance_sampling_level=args.importance_sampling_level,
+                max_tokens=args.max_completion_length,
+                use_compilation=args.use_compilation,
+                jsonl_logger=jsonl_logger,
+                iteration=iteration,
+                update_counter=update_counter,
+                log_samples=should_log_samples,
+                actor_metadata=None,
+            )
 
-        # Cleanup
-        del all_completions, all_completion_texts, batch_indices
-        del ordered_completions, ordered_completion_texts, ordered_batch_indices
-        del advantages, reward_metrics
-        mx.clear_cache()
+            # Cleanup
+            del all_completions, all_completion_texts, batch_indices
+            del ordered_completions, ordered_completion_texts, ordered_batch_indices
+            del advantages, reward_metrics
+            mx.clear_cache()
 
         # Gradient accumulation
-        if prev_grad is not None:
+        if prev_grad is not None and grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
         # Apply gradients
-        if do_update:
+        if do_update and grad is not None:
             update_counter += 1
             grad = average_gradients(grad)
             if grad_accum_steps > 1:
@@ -3599,14 +3823,6 @@ def train_grpo(
             optimizer.update(model, grad)
             grad = None
             mx.clear_cache()
-
-            # Multi-actor sync and maintenance
-            if multi_actor:
-                multi_actor.sync_weights()
-                # Update references periodically
-                update_ref_freq = getattr(args, 'actor_update_references_frequency', 50)
-                if update_counter % update_ref_freq == 0:
-                    multi_actor.update_references()
 
             # Aggressive GC if enabled
             if args.aggressive_gc:
@@ -3749,16 +3965,18 @@ def train_grpo(
         n_tokens += int(toks)
         steps += 1
 
-        # Accumulate metrics
+        # Accumulate metrics (skip non-numeric values like lists/dicts)
         for k, v in metrics.items():
-            if k in accumulated_metrics:
+            if k in accumulated_metrics and isinstance(v, (int, float)) and not isinstance(v, bool):
                 accumulated_metrics[k] += float(v) if hasattr(v, 'item') else float(v)
 
         # Track KL spikes
-        if kl_spike_tracker is not None:
+        if kl_spike_tracker is not None and "kl" in metrics.keys():
             kl_val = float(metrics["kl"]) if hasattr(metrics["kl"], 'item') else metrics["kl"]
             reward_val = float(metrics["total_rewards_mean"]) if hasattr(metrics["total_rewards_mean"], 'item') else metrics["total_rewards_mean"]
             kl_spike_tracker.update(it, kl_val, reward_val)
+        else:
+            pprint.print(metrics)
 
         mx.eval(state, mx.array(losses), mx.array(n_tokens), grad_accum)
 
