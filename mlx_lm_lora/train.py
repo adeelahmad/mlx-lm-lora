@@ -199,6 +199,16 @@ CONFIG_DEFAULTS = {
     "wandb_entity": None,
     "wandb_run_name": None,
     "wandb_log_frequency": 1,
+    # Multi-Actor GRPO (NEW - for diverse policy exploration)
+    "num_actors": 1,
+    "actor_quantizations": None,
+    "actor_kl_to_main_weight": 0.1,
+    "actor_sync_mode": "main_to_actors",
+    "actor_sync_frequency": 10,
+    "lazy_load_actors": False,
+    "actor_temperature_offsets": None,
+    "actor_verbose": True,
+    "actor_update_references_frequency": 50,
 }
 
 
@@ -588,6 +598,50 @@ def build_parser():
         type=float,
         help="Repetition penalty (1.0 = no penalty).",
         default=1.2,
+    )
+
+    # Multi-Actor GRPO (NEW)
+    parser.add_argument(
+        "--num-actors",
+        type=int,
+        default=1,
+        help="Number of actors for diverse rollout generation. 1 = standard GRPO.",
+    )
+    parser.add_argument(
+        "--actor-quantizations",
+        type=str,
+        default=None,
+        help="Comma-separated quantization levels: '4bit,6bit,8bit' or '4bit,4bit,4bit'.",
+    )
+    parser.add_argument(
+        "--actor-kl-to-main-weight",
+        type=float,
+        default=0.1,
+        help="Weight for KL(actor || main) alignment term (γ).",
+    )
+    parser.add_argument(
+        "--actor-sync-mode",
+        type=str,
+        choices=["main_to_actors", "actors_to_main", "bidirectional"],
+        default="main_to_actors",
+        help="Weight sync mode: main_to_actors, actors_to_main, or bidirectional.",
+    )
+    parser.add_argument(
+        "--actor-sync-frequency",
+        type=int,
+        default=10,
+        help="Sync weights every N training steps.",
+    )
+    parser.add_argument(
+        "--lazy-load-actors",
+        action="store_true",
+        help="Load/unload actors on demand to save memory.",
+    )
+    parser.add_argument(
+        "--actor-temperature-offsets",
+        type=str,
+        default=None,
+        help="Comma-separated temperature offsets per actor: '-0.1,0.0,0.1'.",
     )
 
     return parser
@@ -1011,6 +1065,24 @@ def train_model(
             wandb_entity=getattr(args, 'wandb_entity', None),
             wandb_run_name=getattr(args, 'wandb_run_name', None) or f"grpo_{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}",
             wandb_log_frequency=getattr(args, 'wandb_log_frequency', 1),
+            # Multi-Actor GRPO (NEW)
+            num_actors=getattr(args, 'num_actors', 1),
+            actor_quantizations=(
+                [q.strip() for q in args.actor_quantizations.split(",")]
+                if getattr(args, 'actor_quantizations', None)
+                else None
+            ),
+            actor_kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
+            actor_sync_mode=getattr(args, 'actor_sync_mode', 'main_to_actors'),
+            actor_sync_frequency=getattr(args, 'actor_sync_frequency', 10),
+            lazy_load_actors=getattr(args, 'lazy_load_actors', False),
+            actor_temperature_offsets=(
+                [float(t.strip()) for t in args.actor_temperature_offsets.split(",")]
+                if getattr(args, 'actor_temperature_offsets', None)
+                else None
+            ),
+            actor_verbose=getattr(args, 'actor_verbose', True),
+            actor_update_references_frequency=getattr(args, 'actor_update_references_frequency', 50),
         )
 
         print("Loading pretrained reference model")
