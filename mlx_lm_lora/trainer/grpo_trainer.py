@@ -10,13 +10,14 @@ Architecture Philosophy:
 - Performance optimizations where they matter
 - Professional logging and monitoring
 
-Version: 4.0.0 - HYBRID PROFESSIONAL EDITION
+Version: 4.1.0 - HYBRID PROFESSIONAL EDITION + PHASED GENERATION
 Author: Synthesis of battle-tested production code + cutting-edge optimizations
-Last Updated: 2025-12-21
+Last Updated: 2025-01-12
 
 Features:
 ✅ Clean, proven architecture (batch_generate + separate reward calculation)
 ✅ BiasedSampler for intelligent thinking tag control (OPTIONAL)
+✅ Phased Generation Pipeline for thinking models (NEW, OPTIONAL)
 ✅ Aggressive compilation on hot paths (OPTIONAL, 7x faster)
 ✅ Strategic memory management (50% less memory)
 ✅ Comprehensive tracking (diversity, KL spikes, statistics)
@@ -29,6 +30,7 @@ Performance:
 - Default mode: Same as original (proven, stable)
 - Optimized mode: 7-10x faster, 50% less memory
 - Biased mode: Intelligent thinking tag control
+- Phased mode: Multi-phase constrained generation for thinking models
 
 Quality Standards:
 - Type hints throughout
@@ -40,16 +42,17 @@ Quality Standards:
 """
 
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional, Dict, Any, Union, Tuple, Callable
-from functools import partial
 import hashlib
 import gc
-from collections import defaultdict, deque
-import threading
-from queue import Queue
 import json
+import logging
+import threading
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+from queue import Queue
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -62,9 +65,23 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
-    BatchKVCache,
     load_prompt_cache,
 )
+from mlx_lm.tuner.callbacks import TrainingCallback
+from tqdm import tqdm
+
+from .grpo_reward_functions import (
+    RewardFunctions,
+    r1_accuracy_reward_func,
+    r1_count_xml,
+    r1_int_reward_func,
+    r1_soft_format_reward_func,
+    r1_strict_format_reward_func,
+)
+from .sft_trainer import SFTTrainingArgs, average_gradients, grad_checkpoint
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -78,7 +95,7 @@ def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
     xtc_threshold: float,
-    xtc_special_tokens: List[int],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> mx.array:
     """
     Apply XTC (eXtended Temperature Control) sampling to logits.
@@ -120,7 +137,7 @@ def make_enhanced_sampler(
     top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = None,
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Callable[[mx.array], mx.array]:
     """
     Make an enhanced sampler with MLX-LM features including XTC.
@@ -145,8 +162,7 @@ def make_enhanced_sampler(
     if xtc_probability > 0.0 and xtc_special_tokens is None:
         xtc_special_tokens = []
 
-    # For now, use mlx_lm's make_sampler for non-XTC cases
-    # Full integration would require copying all @mx.compile sampling functions
+    # For non-XTC cases, use mlx_lm's make_sampler
     if xtc_probability == 0.0:
         return make_sampler(temp, top_p, min_p, min_tokens_to_keep, top_k)
 
@@ -186,7 +202,7 @@ def make_logits_processors(
     logit_bias: Optional[Dict[int, float]] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
-):
+) -> List[Callable]:
     """
     Make logits processors for generation.
 
@@ -224,7 +240,7 @@ def make_logits_processors(
     return logits_processors
 
 
-def make_repetition_penalty(penalty: float, context_size: int = 20):
+def make_repetition_penalty(penalty: float, context_size: int = 20) -> Callable:
     """
     Make repetition penalty processor.
 
@@ -258,22 +274,11 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
     return repetition_penalty_processor
 
 
-from mlx_lm.models import cache as mlx_cache
-from mlx_lm.tuner.callbacks import TrainingCallback
-from tqdm import tqdm
-
-from .grpo_reward_functions import (
-    RewardFunctions,
-    r1_accuracy_reward_func,
-    r1_count_xml,
-    r1_int_reward_func,
-    r1_soft_format_reward_func,
-    r1_strict_format_reward_func,
-)
-from .sft_trainer import SFTTrainingArgs, average_gradients, grad_checkpoint
-
-
-def selective_grad_checkpoint(model, checkpoint_layers=None, checkpoint_frequency=1):
+def selective_grad_checkpoint(
+    model: nn.Module,
+    checkpoint_layers: Optional[List[int]] = None,
+    checkpoint_frequency: int = 1,
+) -> int:
     """
     Optimized selective gradient checkpointing.
 
@@ -317,9 +322,343 @@ def selective_grad_checkpoint(model, checkpoint_layers=None, checkpoint_frequenc
     return checkpointed_count
 
 
-import logging
+# =============================================================================
+# PHASED GENERATION PIPELINE - For Thinking Models
+# =============================================================================
 
-logger = logging.getLogger(__name__)
+
+@dataclass
+class GenerationPhase:
+    """Configuration for a single generation phase."""
+
+    name: str
+    max_tokens: int
+    stop_sequences: List[str]
+    temperature: float
+    top_p: float = 0.95
+    top_k: int = 20
+    min_p: float = 0.0
+    logit_biases: Optional[Dict[int, float]] = None
+    min_tokens: int = 0
+    continue_from_previous: bool = True
+    repetition_penalty: float = 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "name": self.name,
+            "max_tokens": self.max_tokens,
+            "stop_sequences": self.stop_sequences,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "logit_biases": self.logit_biases,
+            "min_tokens": self.min_tokens,
+            "continue_from_previous": self.continue_from_previous,
+            "repetition_penalty": self.repetition_penalty,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GenerationPhase":
+        """Create from dictionary."""
+        return cls(**data)
+
+
+@dataclass
+class PhasedGenerationConfig:
+    """Multi-phase generation configuration."""
+
+    phases: List[GenerationPhase]
+    fallback_to_single_phase: bool = True  # Non-breaking: falls back if phases fail
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "phases": [p.to_dict() for p in self.phases],
+            "fallback_to_single_phase": self.fallback_to_single_phase,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PhasedGenerationConfig":
+        """Create from dictionary."""
+        phases = [GenerationPhase.from_dict(p) for p in data.get("phases", [])]
+        return cls(
+            phases=phases,
+            fallback_to_single_phase=data.get("fallback_to_single_phase", True),
+        )
+
+
+def get_default_thinking_phases(
+    thinking_max_tokens: int = 1500,
+    answer_max_tokens: int = 500,
+    thinking_temperature: float = 0.7,
+    answer_temperature: float = 0.5,
+    min_thinking_tokens: int = 50,
+) -> List[GenerationPhase]:
+    """
+    Default two-phase config for thinking models.
+
+    Args:
+        thinking_max_tokens: Maximum tokens for thinking phase
+        answer_max_tokens: Maximum tokens for answer phase
+        thinking_temperature: Temperature for thinking (higher = more exploration)
+        answer_temperature: Temperature for answer (lower = more focused)
+        min_thinking_tokens: Minimum tokens before allowing </think>
+
+    Returns:
+        List of GenerationPhase configurations
+    """
+    return [
+        GenerationPhase(
+            name="thinking",
+            max_tokens=thinking_max_tokens,
+            stop_sequences=["</think>"],
+            temperature=thinking_temperature,
+            min_tokens=min_thinking_tokens,
+            top_p=0.95,
+            top_k=30,
+            repetition_penalty=1.1,
+        ),
+        GenerationPhase(
+            name="answer",
+            max_tokens=answer_max_tokens,
+            stop_sequences=["</answer>", "<|im_end|>", "<|endoftext|>"],
+            temperature=answer_temperature,
+            continue_from_previous=True,
+            top_p=0.9,
+            top_k=20,
+            repetition_penalty=1.2,
+        ),
+    ]
+
+
+class MinTokensSampler:
+    """
+    Sampler wrapper that prevents stop sequences before min_tokens.
+
+    This wraps a base sampler and suppresses stop token IDs until
+    the minimum token count is reached.
+    """
+
+    def __init__(
+        self,
+        base_sampler: Callable,
+        tokenizer,
+        stop_sequences: List[str],
+        min_tokens: int,
+        logit_biases: Optional[Dict[int, float]] = None,
+    ):
+        self.base_sampler = base_sampler
+        self.tokenizer = tokenizer
+        self.min_tokens = min_tokens
+        self.logit_biases = logit_biases or {}
+        self.position = 0
+
+        # Get stop token IDs
+        self.stop_token_ids = set()
+        for seq in stop_sequences:
+            try:
+                ids = tokenizer.encode(seq)
+                if ids:
+                    self.stop_token_ids.add(ids[0])
+            except Exception:
+                pass
+
+    def __call__(self, logits: mx.array) -> mx.array:
+        """Apply min_tokens constraint and biases, then sample."""
+        # Suppress stop tokens before min_tokens
+        if self.position < self.min_tokens and self.stop_token_ids:
+            for token_id in self.stop_token_ids:
+                if token_id < logits.shape[-1]:
+                    # Use indexing that works with MLX
+                    logits = mx.where(
+                        mx.arange(logits.shape[-1]) == token_id,
+                        logits - 100.0,
+                        logits,
+                    )
+
+        # Apply custom logit biases
+        for token_id, bias in self.logit_biases.items():
+            if token_id < logits.shape[-1]:
+                logits = mx.where(
+                    mx.arange(logits.shape[-1]) == token_id,
+                    logits + bias,
+                    logits,
+                )
+
+        self.position += 1
+        return self.base_sampler(logits)
+
+    def reset(self):
+        """Reset position counter for new generation."""
+        self.position = 0
+
+
+def execute_generation_phase(
+    model: nn.Module,
+    tokenizer,
+    prompt: str,
+    phase: GenerationPhase,
+    prompt_cache: Optional[Any] = None,
+) -> Tuple[str, Optional[Any], bool, int]:
+    """
+    Execute a single generation phase.
+
+    Args:
+        model: The language model
+        tokenizer: Tokenizer instance
+        prompt: Input prompt (includes previous phases if continuing)
+        phase: Phase configuration
+        prompt_cache: Optional KV cache from previous phase
+
+    Returns:
+        Tuple of (generated_text, updated_cache, hit_stop_sequence, tokens_generated)
+    """
+    # Create base sampler with phase-specific parameters
+    base_sampler = make_sampler(
+        temp=phase.temperature,
+        top_p=phase.top_p,
+        min_p=phase.min_p,
+        top_k=phase.top_k,
+    )
+
+    # Wrap with min_tokens constraint if needed
+    if phase.min_tokens > 0 or phase.logit_biases:
+        sampler = MinTokensSampler(
+            base_sampler=base_sampler,
+            tokenizer=tokenizer,
+            stop_sequences=phase.stop_sequences,
+            min_tokens=phase.min_tokens,
+            logit_biases=phase.logit_biases,
+        )
+    else:
+        sampler = base_sampler
+
+    # Generate
+    try:
+        output = generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=phase.max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            verbose=False,
+        )
+    except Exception as e:
+        logger.warning(f"Phase '{phase.name}' generation failed: {e}")
+        return "", prompt_cache, False, 0
+
+    # Check for stop sequence
+    hit_stop = False
+    for seq in phase.stop_sequences:
+        if seq in output:
+            hit_stop = True
+            # Truncate at stop sequence (include the stop sequence)
+            stop_idx = output.find(seq) + len(seq)
+            output = output[:stop_idx]
+            break
+
+    tokens_generated = len(tokenizer.encode(output)) if output else 0
+
+    return output, prompt_cache, hit_stop, tokens_generated
+
+
+def generate_phased(
+    model: nn.Module,
+    tokenizer,
+    prompt: str,
+    phases: List[GenerationPhase],
+    fallback_max_tokens: int = 2048,
+    fallback_temperature: float = 0.7,
+    verbose: bool = False,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Execute multi-phase generation pipeline.
+
+    Non-breaking: If all phases fail, falls back to single-pass generation.
+
+    Args:
+        model: The language model
+        tokenizer: Tokenizer instance
+        prompt: Input prompt
+        phases: List of GenerationPhase configurations
+        fallback_max_tokens: Max tokens for fallback single-pass generation
+        fallback_temperature: Temperature for fallback generation
+        verbose: Log phase details
+
+    Returns:
+        Tuple of (full_output, phase_outputs_list)
+    """
+    if not phases:
+        # No phases configured, fall back to simple generation
+        sampler = make_sampler(temp=fallback_temperature)
+        output = generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            max_tokens=fallback_max_tokens,
+            sampler=sampler,
+            verbose=False,
+        )
+        return output, [{"phase": "fallback", "output": output, "hit_stop": False}]
+
+    full_output = ""
+    phase_outputs = []
+    current_prompt = prompt
+    prompt_cache = None
+
+    # Try to create prompt cache for efficiency
+    try:
+        prompt_cache = mlx_cache.make_prompt_cache(model)
+    except Exception as e:
+        logger.debug(f"Could not create prompt cache: {e}")
+        prompt_cache = None
+
+    for i, phase in enumerate(phases):
+        if verbose:
+            logger.info(f"Executing phase {i + 1}/{len(phases)}: {phase.name}")
+
+        # Use cache from previous phase if continuing
+        use_cache = prompt_cache if (phase.continue_from_previous and i > 0) else None
+
+        phase_output, prompt_cache, hit_stop, tokens = execute_generation_phase(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=current_prompt,
+            phase=phase,
+            prompt_cache=use_cache,
+        )
+
+        phase_info = {
+            "phase": phase.name,
+            "output": phase_output,
+            "hit_stop": hit_stop,
+            "tokens": tokens,
+            "stop_sequences": phase.stop_sequences,
+        }
+        phase_outputs.append(phase_info)
+
+        if verbose:
+            logger.info(
+                f"Phase '{phase.name}': {tokens} tokens, hit_stop={hit_stop}"
+            )
+
+        full_output += phase_output
+        current_prompt = current_prompt + phase_output
+
+        # If phase didn't hit stop sequence and it's not the last phase, log warning
+        if not hit_stop and i < len(phases) - 1:
+            logger.warning(
+                f"Phase '{phase.name}' didn't hit stop sequence, continuing anyway"
+            )
+
+    # Cleanup
+    if prompt_cache is not None:
+        del prompt_cache
+
+    return full_output, phase_outputs
 
 
 # =============================================================================
@@ -339,7 +678,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     seed: int = field(
         default=0,
-        metadata={"help": "Number of responses per prompt."},
+        metadata={"help": "Random seed for reproducibility."},
     )
 
     beta: float = field(default=0.1, metadata={"help": "KL penalty coefficient."})
@@ -347,14 +686,14 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         default=1e-4,
         metadata={"help": "Lower epsilon for importance sampling clipping."},
     )
-    epsilon_high: float = field(
+    epsilon_high: Optional[float] = field(
         default=None,
         metadata={"help": "Upper epsilon for clipping. Defaults to epsilon if None."},
     )
     max_completion_length: int = field(
         default=2048, metadata={"help": "Maximum tokens to generate per completion."}
     )
-    reference_model_path: str = field(
+    reference_model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to reference model. If None, uses same model."},
     )
@@ -372,7 +711,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
             "help": "Weights for reward functions. If None, all weighted equally."
         },
     )
-    importance_sampling_level: str = field(
+    importance_sampling_level: Optional[str] = field(
         default=None,
         metadata={"help": "'token', 'sequence', or None for importance sampling."},
     )
@@ -395,9 +734,9 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Minimum tokens to keep during sampling."},
     )
 
-    # MLX-LM Enhanced Sampling (NEW - production-grade features)
+    # MLX-LM Enhanced Sampling
     repetition_penalty: float = field(
-        default=1.2,  # 1.0 = no penalty
+        default=1.2,
         metadata={
             "help": "Repetition penalty (1.0 = no penalty, >1.0 = penalize repetition). "
             "Paper: https://arxiv.org/abs/1909.05858. Recommended: 1.1-1.3 for GRPO."
@@ -415,7 +754,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
     xtc_probability: float = field(
-        default=0.0,  # 0.0 = disabled
+        default=0.0,
         metadata={
             "help": "XTC sampling probability (0.0-1.0). Excludes high-prob tokens. "
             "Improves diversity. Typical: 0.1-0.3."
@@ -428,13 +767,12 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
 
-    # KV Cache Optimization (NEW - MLX-LM advanced features)
+    # KV Cache Optimization
     kv_bits: Optional[int] = field(
-        default=None,  # None = no quantization (default)
+        default=None,
         metadata={
             "help": "Number of bits for KV cache quantization (4, 8). "
-            "Reduces memory by 50-75%. Recommended: 8 for minimal quality loss. "
-            "Example: kv_bits=8, kv_group_size=64 saves ~60% memory."
+            "Reduces memory by 50-75%. Recommended: 8 for minimal quality loss."
         },
     )
     kv_group_size: int = field(
@@ -452,17 +790,56 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         default=None,
         metadata={
             "help": "Maximum KV cache size (tokens). Enables rotating cache for long contexts. "
-            "None = unlimited. Example: 4096 for memory-constrained scenarios."
+            "None = unlimited."
         },
     )
 
-    # Advanced features (OPTIONAL - default=False for performance)
+    # Phased Generation (NEW - for thinking models)
+    use_phased_generation: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable multi-phase constrained generation for thinking models. "
+            "Non-breaking: off by default, existing behavior preserved."
+        },
+    )
+    generation_phases: Optional[List[Dict[str, Any]]] = field(
+        default=None,
+        metadata={
+            "help": "Phase configurations as list of dicts. If None and use_phased_generation=True, "
+            "uses default thinking+answer phases."
+        },
+    )
+    phased_thinking_max_tokens: int = field(
+        default=1500,
+        metadata={"help": "Max tokens for thinking phase (default phases)."},
+    )
+    phased_answer_max_tokens: int = field(
+        default=500,
+        metadata={"help": "Max tokens for answer phase (default phases)."},
+    )
+    phased_min_thinking_tokens: int = field(
+        default=50,
+        metadata={"help": "Minimum tokens before allowing </think> (default phases)."},
+    )
+    phased_thinking_temperature: float = field(
+        default=0.7,
+        metadata={"help": "Temperature for thinking phase (default phases)."},
+    )
+    phased_answer_temperature: float = field(
+        default=0.5,
+        metadata={"help": "Temperature for answer phase (default phases)."},
+    )
+    phased_verbose: bool = field(
+        default=False,
+        metadata={"help": "Log phase execution details."},
+    )
+
+    # BiasedSampler (legacy - use phased generation instead for new code)
     use_biased_sampler: bool = field(
-        default=True,  # ⚠️ Keep False for speed - 5-10x slower than batch_generate
+        default=False,
         metadata={
             "help": "Enable BiasedSampler for thinking tag control. "
-            "WARNING: 5-10x slower. Use only when strict tag control needed. "
-            "Recommendation: Train with False, fine-tune last few iters with True."
+            "WARNING: 5-10x slower. Consider use_phased_generation instead."
         },
     )
     min_think_tokens: int = field(
@@ -470,7 +847,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Minimum tokens before allowing </think> closure."},
     )
     max_think_tokens: int = field(
-        default=512,
+        default=120,
         metadata={"help": "Start strong bias toward </think> closure."},
     )
     think_close_bias_start: int = field(
@@ -486,17 +863,29 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Bias decay per step (0.995 = slow decay)."},
     )
     force_close_after: int = field(
-        default=620,
+        default=220,
         metadata={"help": "Absolute maximum - force </think> closure."},
     )
     sampler_verbose: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Log bias applications for debugging."},
     )
 
-    # Performance optimizations (✅ ENABLED BY DEFAULT)
+    # Gradient checkpointing options
+    grad_checkpoint_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": "Specific layer indices to checkpoint. If None, uses frequency-based."
+        },
+    )
+    grad_checkpoint_frequency: int = field(
+        default=1,
+        metadata={"help": "Checkpoint every N layers. 1 = all layers."},
+    )
+
+    # Performance optimizations
     use_compilation: bool = field(
-        default=False,  # ✅ CHANGED from False - 7x speedup
+        default=False,
         metadata={"help": "Use MLX compilation for 7x speedup (recommended)."},
     )
     aggressive_gc: bool = field(
@@ -504,9 +893,9 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Aggressive garbage collection for memory efficiency."},
     )
 
-    # Sample logging (✅ ENABLED BY DEFAULT)
+    # Sample logging
     log_samples: bool = field(
-        default=True,  # ✅ CHANGED from False
+        default=True,
         metadata={"help": "Log generation samples to JSONL file."},
     )
     log_samples_path: Optional[str] = field(
@@ -520,13 +909,13 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Log samples every N iterations."},
     )
 
-    # Tracking features (✅ ENABLED BY DEFAULT)
+    # Tracking features
     track_diversity: bool = field(
-        default=True,  # ✅ CHANGED from False
+        default=True,
         metadata={"help": "Track generation diversity to detect mode collapse."},
     )
     track_kl_spikes: bool = field(
-        default=True,  # ✅ CHANGED from False
+        default=True,
         metadata={"help": "Track KL spikes for analysis."},
     )
     kl_spike_threshold: float = field(
@@ -534,9 +923,9 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "KL threshold for spike detection."},
     )
 
-    # WandB Integration (✅ ENABLED BY DEFAULT - NEW!)
+    # WandB Integration
     use_wandb: bool = field(
-        default=True,  # ✅ ENABLED BY DEFAULT
+        default=True,
         metadata={"help": "Enable Weights & Biases comprehensive logging."},
     )
     wandb_project: str = field(
@@ -584,8 +973,8 @@ class JSONLLogger:
     def __init__(self, filepath: Path, enabled: bool = True):
         self.filepath = filepath
         self.enabled = enabled
-        self.queue = Queue()
-        self.worker_thread = None
+        self.queue: Queue = Queue()
+        self.worker_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._shutdown = False
 
@@ -610,7 +999,7 @@ class JSONLLogger:
                     f.write(json_str + "\n")
                     f.flush()
                     self.queue.task_done()
-                except:
+                except Exception:
                     continue  # Timeout - check shutdown flag
 
     def log(self, data: Dict[str, Any]):
@@ -640,9 +1029,9 @@ class DiversityTracker:
 
     def __init__(self, window_size: int = 10):
         self.window_size = window_size
-        self.generation_history = deque(maxlen=window_size * 100)
-        self.diversity_by_update = {}
-        self.cross_update_patterns = defaultdict(set)
+        self.generation_history: deque = deque(maxlen=window_size * 100)
+        self.diversity_by_update: Dict[int, Dict] = {}
+        self.cross_update_patterns: Dict[str, set] = defaultdict(set)
 
     def add_generation(self, update_idx: int, generation_text: str, prompt_hash: str):
         """Add generation with full text hash for accurate tracking."""
@@ -690,8 +1079,8 @@ class KLSpikeTracker:
     def __init__(self, threshold: float = 5.0, history_window: int = 10):
         self.threshold = threshold
         self.history_window = history_window
-        self.kl_history = deque(maxlen=history_window * 2)
-        self.spike_events = []
+        self.kl_history: deque = deque(maxlen=history_window * 2)
+        self.spike_events: List[Dict] = []
 
     def update(self, iteration: int, kl: float, reward: float):
         """Track KL and detect spikes."""
@@ -729,96 +1118,6 @@ class KLSpikeTracker:
 
 class StatisticsTracker:
     """
-    Comprehensive statistics tracking for generation quality.
-
-    Tracks:
-    - Format compliance (thinking tags, answer tags)
-    - Identity mentions (model name leakage)
-    - Generation lengths
-    - Reward history
-    - KL history
-    - Loss history
-    """
-
-    def __init__(self):
-        self.iteration_stats = []
-        self.reward_history = defaultdict(list)
-        self.kl_history = []
-        self.loss_history = []
-        self.format_stats = defaultdict(int)
-        self.identity_stats = defaultdict(int)
-        self.generation_lengths = []
-
-    def add_iteration_stats(self, iteration: int, stats: Dict[str, Any]):
-        """Add iteration statistics."""
-        stats["iteration"] = iteration
-        stats["timestamp"] = time.time()
-        self.iteration_stats.append(stats)
-
-        if "kl" in stats:
-            self.kl_history.append((iteration, stats["kl"]))
-        if "loss" in stats:
-            self.loss_history.append((iteration, stats["loss"]))
-
-    def add_generation_stats(self, generation: str):
-        """Track generation statistics."""
-        self.generation_lengths.append(len(generation))
-
-        # Format compliance
-        if "<think>" in generation and "</think>" in generation:
-            self.format_stats["has_think_tags"] += 1
-        else:
-            self.format_stats["missing_think_tags"] += 1
-
-        gen_lower = generation.lower()
-
-        if "<|im_start|>" in generation:
-            self.format_stats["has_im_start"] += 1
-
-        # Identity tracking (model name leakage detection)
-        if "qwen" in gen_lower:
-            self.identity_stats["qwen_mentions"] += 1
-        if "tongyi" in gen_lower:
-            self.identity_stats["tongyi_mentions"] += 1
-        if "alibaba" in gen_lower:
-            self.identity_stats["alibaba_mentions"] += 1
-
-    def get_summary(self) -> Dict[str, Any]:
-        """Get comprehensive summary."""
-        total_gens = self.format_stats.get("has_think_tags", 0) + self.format_stats.get(
-            "missing_think_tags", 0
-        )
-
-        return {
-            "total_iterations": len(self.iteration_stats),
-            "total_generations": total_gens,
-            "format_compliance": {
-                "think_tags_present": self.format_stats.get("has_think_tags", 0),
-                "compliance_rate": (
-                    self.format_stats.get("has_think_tags", 0) / total_gens
-                    if total_gens > 0
-                    else 0
-                ),
-            },
-            "identity_mentions": dict(self.identity_stats),
-            "avg_generation_length": (
-                np.mean(self.generation_lengths) if self.generation_lengths else 0
-            ),
-            "kl_stats": {
-                "mean": np.mean([k for _, k in self.kl_history])
-                if self.kl_history
-                else 0,
-                "max": np.max([k for _, k in self.kl_history])
-                if self.kl_history
-                else 0,
-            }
-            if self.kl_history
-            else {},
-        }
-
-
-class StatisticsTracker:
-    """
     Comprehensive statistics tracking for training analysis.
 
     Tracks:
@@ -829,13 +1128,13 @@ class StatisticsTracker:
     """
 
     def __init__(self):
-        self.iteration_stats = []
-        self.reward_history = defaultdict(list)
-        self.kl_history = []
-        self.loss_history = []
-        self.format_stats = defaultdict(int)
-        self.identity_stats = defaultdict(int)
-        self.generation_lengths = []
+        self.iteration_stats: List[Dict] = []
+        self.reward_history: Dict[str, List] = defaultdict(list)
+        self.kl_history: List[Tuple[int, float]] = []
+        self.loss_history: List[Tuple[int, float]] = []
+        self.format_stats: Dict[str, int] = defaultdict(int)
+        self.identity_stats: Dict[str, int] = defaultdict(int)
+        self.generation_lengths: List[int] = []
 
     def add_iteration_stats(self, iteration: int, stats: Dict[str, Any]):
         """Add iteration statistics."""
@@ -878,6 +1177,8 @@ class StatisticsTracker:
             "missing_think_tags", 0
         )
 
+        kl_values = [k for _, k in self.kl_history] if self.kl_history else []
+
         return {
             "total_iterations": len(self.iteration_stats),
             "total_generations": total_gens,
@@ -891,23 +1192,17 @@ class StatisticsTracker:
             },
             "identity_mentions": dict(self.identity_stats),
             "avg_generation_length": (
-                np.mean(self.generation_lengths) if self.generation_lengths else 0
+                float(np.mean(self.generation_lengths)) if self.generation_lengths else 0
             ),
             "kl_stats": {
-                "mean": np.mean([k for _, k in self.kl_history])
-                if self.kl_history
-                else 0,
-                "max": np.max([k for _, k in self.kl_history])
-                if self.kl_history
-                else 0,
-            }
-            if self.kl_history
-            else {},
+                "mean": float(np.mean(kl_values)) if kl_values else 0,
+                "max": float(np.max(kl_values)) if kl_values else 0,
+            },
         }
 
 
 # =============================================================================
-# BIASED SAMPLER - Intelligent thinking tag control
+# BIASED SAMPLER - Intelligent thinking tag control (Legacy)
 # =============================================================================
 
 
@@ -917,9 +1212,8 @@ class BiasedSampler:
 
     PERFORMANCE NOTE:
     - BiasedSampler is 5-10x slower than batch_generate due to sequential generation
-    - Use only when you need strict thinking tag control
+    - Consider using phased generation (use_phased_generation=True) instead
     - For production: use batch_generate (default, use_biased_sampler=False)
-    - Consider: Train with batch_generate, then fine-tune last few iters with BiasedSampler
 
     Five-phase bias strategy:
     1. Block early closure (0-min_think_tokens)
@@ -927,25 +1221,11 @@ class BiasedSampler:
     3. Progressive bias (bias_start to max_think_tokens)
     4. Strong encouragement (max_think_tokens to force_close_after)
     5. Force closure (>= force_close_after)
-
-    Optimizations:
-    - Token IDs cached at initialization
-    - Bias computations minimized
-    - State tracking lightweight
-
-    Example:
-        sampler = BiasedSampler(
-            base_sampler=make_sampler(temperature=0.8),
-            tokenizer=tokenizer,
-            min_think_tokens=100,
-            max_think_tokens=600,
-            force_close_after=800
-        )
     """
 
     def __init__(
         self,
-        base_sampler,
+        base_sampler: Callable,
         tokenizer,
         min_think_tokens: int = 50,
         max_think_tokens: int = 800,
@@ -983,10 +1263,10 @@ class BiasedSampler:
         try:
             ids = self.tokenizer.encode(token)
             return ids[0] if ids else None
-        except:
+        except Exception:
             return None
 
-    def __call__(self, logits: mx.array) -> int:
+    def __call__(self, logits: mx.array) -> mx.array:
         """Apply biases and sample next token."""
         biased_logits = logits
 
@@ -1012,10 +1292,14 @@ class BiasedSampler:
             return logits
 
         thinking_length = self.position - self.thinking_start_pos
+        vocab_size = logits.shape[-1]
+
+        # Create index mask for the think_close token
+        token_mask = mx.arange(vocab_size) == self.think_close_id
 
         # Phase 1: Block early closure
         if thinking_length < self.min_think_tokens:
-            logits = logits.at[self.think_close_id].add(-15.0)
+            logits = mx.where(token_mask, logits - 15.0, logits)
 
         # Phase 2: Neutral zone
         elif self.min_think_tokens <= thinking_length < self.think_close_bias_start:
@@ -1025,9 +1309,9 @@ class BiasedSampler:
         elif self.think_close_bias_start <= thinking_length < self.max_think_tokens:
             steps_over = thinking_length - self.think_close_bias_start
             bias = self.think_close_bias_value * (
-                self.think_close_bias_decay**steps_over
+                self.think_close_bias_decay ** steps_over
             )
-            logits = logits.at[self.think_close_id].add(bias)
+            logits = mx.where(token_mask, logits + bias, logits)
 
             if self.verbose and thinking_length % 100 == 0:
                 logger.debug(
@@ -1037,7 +1321,7 @@ class BiasedSampler:
         # Phase 4: Strong encouragement
         elif self.max_think_tokens <= thinking_length < self.force_close_after:
             strong_bias = 10.0 + (thinking_length - self.max_think_tokens) * 0.05
-            logits = logits.at[self.think_close_id].add(strong_bias)
+            logits = mx.where(token_mask, logits + strong_bias, logits)
 
             if self.verbose and thinking_length % 50 == 0:
                 logger.debug(
@@ -1050,18 +1334,22 @@ class BiasedSampler:
                 logger.warning(f"FORCING </think> closure at {thinking_length} tokens")
 
             # Force all tokens to very low probability except think_close
-            logits = logits - 50.0  # All tokens get -50
-            logits = logits.at[self.think_close_id].add(
-                100.0
-            )  # think_close gets -50+100=50
+            logits = mx.where(token_mask, logits + 100.0, logits - 50.0)
 
         return logits
 
     def _apply_custom_biases(self, logits: mx.array) -> mx.array:
         """Apply user-defined custom token biases."""
+        vocab_size = logits.shape[-1]
+
         for token_id, bias_spec in self.custom_token_biases.items():
+            if token_id >= vocab_size:
+                continue
+
+            token_mask = mx.arange(vocab_size) == token_id
+
             if isinstance(bias_spec, (int, float)):
-                logits = logits.at[token_id].add(float(bias_spec))
+                logits = mx.where(token_mask, logits + float(bias_spec), logits)
             elif isinstance(bias_spec, dict):
                 start_pos = bias_spec.get("start_pos", 0)
                 end_pos = bias_spec.get("end_pos", float("inf"))
@@ -1070,22 +1358,23 @@ class BiasedSampler:
 
                 if start_pos <= self.position < end_pos:
                     steps = self.position - start_pos
-                    current_bias = value * (decay**steps)
-                    logits = logits.at[token_id].add(current_bias)
+                    current_bias = value * (decay ** steps)
+                    logits = mx.where(token_mask, logits + current_bias, logits)
 
         return logits
 
     def _update_state(self, sampled_token: int):
         """Update internal state based on sampled token."""
-        self.generated_tokens.append(int(sampled_token))
+        token_val = int(sampled_token) if hasattr(sampled_token, 'item') else sampled_token
+        self.generated_tokens.append(token_val)
 
-        if sampled_token == self.think_open_id:
+        if token_val == self.think_open_id:
             self.in_thinking = True
             self.thinking_start_pos = self.position
             if self.verbose:
                 logger.debug(f"<think> opened at position {self.position}")
 
-        elif sampled_token == self.think_close_id:
+        elif token_val == self.think_close_id:
             thinking_length = self.position - self.thinking_start_pos
             self.in_thinking = False
             if self.verbose:
@@ -1098,16 +1387,18 @@ class BiasedSampler:
         self.position = 0
         self.in_thinking = False
         self.thinking_start_pos = 0
-        self.generated_tokens = []
+        self.generated_tokens: List[int] = []
 
 
 # =============================================================================
-# COMPILED FUNCTIONS - Performance critical paths
+# COMPILED FUNCTIONS - Performance critical paths (single definitions)
 # =============================================================================
 
 
 @mx.compile
-def compute_log_probs_compiled(logits: mx.array, targets: mx.array, lengths: mx.array):
+def compute_log_probs_compiled(
+    logits: mx.array, targets: mx.array, lengths: mx.array
+) -> Tuple[mx.array, mx.array]:
     """
     COMPILED: Compute per-token log probabilities.
 
@@ -1124,7 +1415,7 @@ def compute_log_probs_compiled(logits: mx.array, targets: mx.array, lengths: mx.
     # Gather target log probs using advanced indexing
     batch_size, seq_len, vocab_size = logits.shape
 
-    # MLX-compatible broadcasting (not .repeat())
+    # MLX-compatible broadcasting
     batch_indices = mx.broadcast_to(
         mx.arange(batch_size)[:, None], (batch_size, seq_len)
     )
@@ -1148,21 +1439,12 @@ def compute_kl_divergence_compiled(
     policy_logps: mx.array,
     ref_logps: mx.array,
     length_mask: mx.array,
-    direction: str = "reverse",
-):
+) -> mx.array:
     """
-    COMPILED: Compute KL divergence between policy and reference.
-
-    Supports forward and reverse KL.
+    COMPILED: Compute reverse KL divergence between policy and reference.
     """
-    if direction == "forward":
-        kl_div = mx.exp(policy_logps - ref_logps) - (policy_logps - ref_logps) - 1
-    else:  # reverse
-        kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
-
-    # Apply mask
+    kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
     kl_div = mx.where(length_mask, kl_div, mx.zeros_like(kl_div))
-
     return kl_div
 
 
@@ -1171,137 +1453,8 @@ def compute_importance_weights_compiled(
     policy_logps: mx.array,
     ref_logps: mx.array,
     length_mask: mx.array,
-    level: str = "token",
-):
-    """
-    COMPILED: Compute importance sampling weights.
-
-    Supports token-level and sequence-level importance sampling.
-    """
-    log_ratio = policy_logps - ref_logps
-
-    if level == "token":
-        return log_ratio
-    elif level == "sequence":
-        sequence_log_ratio = (log_ratio * length_mask).sum(axis=1) / mx.maximum(
-            length_mask.sum(axis=1), 1.0
-        )
-        return mx.expand_dims(sequence_log_ratio, axis=1)
-    else:
-        return mx.zeros_like(log_ratio)
-
-
-@mx.compile
-def compute_ppo_loss_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    advantages: mx.array,
-    kl_div: mx.array,
-    length_mask: mx.array,
-    epsilon: float,
-    epsilon_high: float,
-    beta: float,
-    importance_level: str = "token",
-):
-    """
-    COMPILED: Compute full PPO loss with KL penalty.
-
-    This is the HOT PATH - compilation critical for performance.
-    10x speedup on large batches.
-    """
-    # Compute importance weights
-    log_importance_weights = compute_importance_weights_compiled(
-        policy_logps, ref_logps, length_mask, importance_level
-    )
-
-    # PPO clipping
-    coef_1 = mx.exp(log_importance_weights)
-    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
-
-    # Compute objectives
-    advantages_expanded = advantages.reshape(-1, 1)
-    unclipped_obj = coef_1 * advantages_expanded
-    clipped_obj = coef_2 * advantages_expanded
-
-    per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
-
-    # Add KL penalty
-    if abs(beta) > 1e-9:
-        per_token_loss = per_token_loss + beta * kl_div
-
-    return per_token_loss, coef_1
-
-
-def compute_advantages_vectorized(
-    rewards: mx.array, batch_indices: List[int], unique_prompt_indices: List[int]
+    use_sequence_level: bool = False,
 ) -> mx.array:
-    """
-    VECTORIZED: Compute advantages from rewards.
-
-    Not compiled due to Python control flow, but fully vectorized for speed.
-    """
-    num_prompts = len(unique_prompt_indices)
-
-    # Map batch indices to positions
-    idx_to_pos = {idx: pos for pos, idx in enumerate(unique_prompt_indices)}
-
-    # Group rewards by prompt
-    prompt_rewards = [[] for _ in range(num_prompts)]
-    for i, bi in enumerate(batch_indices):
-        pos = idx_to_pos[bi]
-        prompt_rewards[pos].append(float(rewards[i]))
-
-    # Compute means and stds
-    prompt_means = mx.array([np.mean(pr) for pr in prompt_rewards])
-    prompt_stds = mx.array([np.std(pr) + 1e-8 for pr in prompt_rewards])
-
-    # Map back to advantages
-    advantages = []
-    for i, bi in enumerate(batch_indices):
-        pos = idx_to_pos[bi]
-        adv = (rewards[i] - prompt_means[pos]) / (prompt_stds[pos] + 1e-4)
-        advantages.append(float(adv))
-
-    return mx.array(advantages)
-
-
-@mx.compile
-def compute_kl_divergence_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    length_mask: mx.array,
-    direction: str = "reverse",
-):
-    """
-    COMPILED: Compute KL divergence between policy and reference.
-
-    Args:
-        policy_logps: Policy log probabilities
-        ref_logps: Reference log probabilities
-        length_mask: Mask for valid tokens
-        direction: "forward" or "reverse"
-
-    Returns:
-        kl_div: KL divergence per token
-    """
-    if direction == "forward":
-        kl_div = mx.exp(policy_logps - ref_logps) - (policy_logps - ref_logps) - 1
-    else:  # reverse
-        kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
-
-    # Apply mask
-    kl_div = mx.where(length_mask, kl_div, mx.zeros_like(kl_div))
-
-    return kl_div
-
-
-@mx.compile
-def compute_importance_weights_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    length_mask: mx.array,
-    level: str = "token",
-):
     """
     COMPILED: Compute importance sampling weights.
 
@@ -1309,84 +1462,27 @@ def compute_importance_weights_compiled(
         policy_logps: Policy log probabilities
         ref_logps: Reference log probabilities
         length_mask: Mask for valid tokens
-        level: "token" or "sequence"
+        use_sequence_level: If True, compute sequence-level weights
 
     Returns:
-        log_importance_weights: Log importance weights
+        log_importance_weights
     """
     log_ratio = policy_logps - ref_logps
 
-    if level == "token":
-        return log_ratio
-    elif level == "sequence":
+    if use_sequence_level:
         sequence_log_ratio = (log_ratio * length_mask).sum(axis=1) / mx.maximum(
             length_mask.sum(axis=1), 1.0
         )
         return mx.expand_dims(sequence_log_ratio, axis=1)
     else:
-        return mx.zeros_like(log_ratio)
-
-
-@mx.compile
-def compute_ppo_loss_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    advantages: mx.array,
-    kl_div: mx.array,
-    length_mask: mx.array,
-    epsilon: float,
-    epsilon_high: float,
-    beta: float,
-    importance_level: str = "token",
-):
-    """
-    COMPILED: Compute full PPO loss with KL penalty.
-
-    This is the HOT PATH - compilation is critical for performance.
-
-    Args:
-        policy_logps: Policy log probabilities
-        ref_logps: Reference log probabilities
-        advantages: Computed advantages
-        kl_div: KL divergence
-        length_mask: Mask for valid tokens
-        epsilon: Lower clipping bound
-        epsilon_high: Upper clipping bound
-        beta: KL penalty coefficient
-        importance_level: "token" or "sequence"
-
-    Returns:
-        per_token_loss: Loss per token
-        coef_1: Importance weights (for metrics)
-    """
-    # Compute importance weights
-    log_importance_weights = compute_importance_weights_compiled(
-        policy_logps, ref_logps, length_mask, importance_level
-    )
-
-    # PPO clipping
-    coef_1 = mx.exp(log_importance_weights)
-    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
-
-    # Compute objectives
-    advantages_expanded = advantages.reshape(-1, 1)
-    unclipped_obj = coef_1 * advantages_expanded
-    clipped_obj = coef_2 * advantages_expanded
-
-    per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
-
-    # Add KL penalty
-    if abs(beta) > 1e-9:
-        per_token_loss = per_token_loss + beta * kl_div
-
-    return per_token_loss, coef_1
+        return log_ratio
 
 
 def compute_advantages_vectorized(
     rewards: mx.array, batch_indices: List[int], unique_prompt_indices: List[int]
 ) -> mx.array:
     """
-    Vectorized advantage computation (NOT compiled - simpler without).
+    Vectorized advantage computation.
 
     Args:
         rewards: Reward values for all completions
@@ -1402,122 +1498,7 @@ def compute_advantages_vectorized(
     idx_to_pos = {idx: pos for pos, idx in enumerate(unique_prompt_indices)}
 
     # Group rewards by prompt
-    prompt_rewards = [[] for _ in range(num_prompts)]
-    for i, bi in enumerate(batch_indices):
-        pos = idx_to_pos[bi]
-        prompt_rewards[pos].append(float(rewards[i]))
-
-    # Compute means and stds
-    prompt_means = mx.array([np.mean(pr) for pr in prompt_rewards])
-    prompt_stds = mx.array([np.std(pr) + 1e-8 for pr in prompt_rewards])
-
-    # Map back to advantages
-    advantages = []
-    for i, bi in enumerate(batch_indices):
-        pos = idx_to_pos[bi]
-        adv = (rewards[i] - prompt_means[pos]) / (prompt_stds[pos] + 1e-4)
-        advantages.append(float(adv))
-
-    return mx.array(advantages)
-
-
-@mx.compile
-def compute_kl_divergence_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    length_mask: mx.array,
-    direction: str = "reverse",
-):
-    """
-    COMPILED: Compute KL divergence.
-    """
-    if direction == "forward":
-        kl_div = mx.exp(policy_logps - ref_logps) - (policy_logps - ref_logps) - 1
-    else:  # reverse
-        kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
-
-    # Apply mask
-    kl_div = mx.where(length_mask, kl_div, mx.zeros_like(kl_div))
-
-    return kl_div
-
-
-@mx.compile
-def compute_importance_weights_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    length_mask: mx.array,
-    level: str = "token",
-):
-    """
-    COMPILED: Compute importance sampling weights.
-    """
-    log_ratio = policy_logps - ref_logps
-
-    if level == "token":
-        return log_ratio
-    elif level == "sequence":
-        sequence_log_ratio = (log_ratio * length_mask).sum(axis=1) / mx.maximum(
-            length_mask.sum(axis=1), 1.0
-        )
-        return mx.expand_dims(sequence_log_ratio, axis=1)
-    else:
-        return mx.zeros_like(log_ratio)
-
-
-@mx.compile
-def compute_ppo_loss_compiled(
-    policy_logps: mx.array,
-    ref_logps: mx.array,
-    advantages: mx.array,
-    kl_div: mx.array,
-    length_mask: mx.array,
-    epsilon: float,
-    epsilon_high: float,
-    beta: float,
-    importance_level: str = "token",
-):
-    """
-    COMPILED: Compute full PPO loss with KL penalty.
-    This is the HOT PATH - compilation critical here.
-    """
-    # Compute importance weights
-    log_importance_weights = compute_importance_weights_compiled(
-        policy_logps, ref_logps, length_mask, importance_level
-    )
-
-    # PPO clipping
-    coef_1 = mx.exp(log_importance_weights)
-    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
-
-    # Compute objectives
-    advantages_expanded = advantages.reshape(-1, 1)
-    unclipped_obj = coef_1 * advantages_expanded
-    clipped_obj = coef_2 * advantages_expanded
-
-    per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
-
-    # Add KL penalty
-    if abs(beta) > 1e-9:
-        per_token_loss = per_token_loss + beta * kl_div
-
-    return per_token_loss, coef_1
-
-
-def compute_advantages_vectorized(
-    rewards: mx.array, batch_indices: List[int], unique_prompt_indices: List[int]
-) -> mx.array:
-    """
-    Vectorized advantage computation.
-    Simple and robust - no compilation needed for this part.
-    """
-    num_prompts = len(unique_prompt_indices)
-
-    # Map batch indices to positions
-    idx_to_pos = {idx: pos for pos, idx in enumerate(unique_prompt_indices)}
-
-    # Group rewards by prompt
-    prompt_rewards = [[] for _ in range(num_prompts)]
+    prompt_rewards: List[List[float]] = [[] for _ in range(num_prompts)]
     for i, bi in enumerate(batch_indices):
         pos = idx_to_pos[bi]
         prompt_rewards[pos].append(float(rewards[i]))
@@ -1537,13 +1518,16 @@ def compute_advantages_vectorized(
 
 
 # =============================================================================
-# CORE FUNCTIONS - With optional compilation
+# CORE FUNCTIONS
 # =============================================================================
 
 
 def get_per_token_logps(
-    model: nn.Module, inputs: mx.array, lengths: mx.array, use_compilation: bool = False
-) -> Tuple[List[mx.array], Optional[Tuple[mx.array, mx.array]]]:
+    model: nn.Module,
+    inputs: mx.array,
+    lengths: mx.array,
+    use_compilation: bool = False,
+) -> Tuple[Optional[List[mx.array]], Optional[Tuple[mx.array, mx.array]]]:
     """
     Compute per-token log probabilities with optional compilation.
 
@@ -1555,11 +1539,9 @@ def get_per_token_logps(
 
     Returns:
         If use_compilation=False:
-            per_token_logps: List of log prob arrays (original format)
-            None
+            (per_token_logps_list, None)
         If use_compilation=True:
-            None
-            (token_log_probs, length_mask): Compiled format
+            (None, (token_log_probs, length_mask))
     """
     logits = model(inputs).astype(mx.float16)
 
@@ -1586,7 +1568,7 @@ def get_per_token_logps(
             ).squeeze(-1)
             per_token_logps.append(token_log_probs)
 
-        mx.eval(logits)
+        mx.eval(per_token_logps)
         return per_token_logps, None
 
 
@@ -1599,18 +1581,22 @@ def generate_grpo(
     temperature: float,
     batch_size: int,
     end_token: str,
-    # Sampler parameters (NO HARDCODING!)
+    # Sampler parameters
     top_p: float = 0.95,
     top_k: int = 20,
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
-    # MLX-LM Enhanced Sampling (NEW)
+    # MLX-LM Enhanced Sampling
     repetition_penalty: float = 1.0,
     repetition_context_size: int = 20,
     logit_bias: Optional[Dict[int, float]] = None,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
-    # NEW: Optional biased sampler parameters
+    # Phased generation (NEW)
+    use_phased_generation: bool = False,
+    generation_phases: Optional[List[GenerationPhase]] = None,
+    phased_verbose: bool = False,
+    # BiasedSampler parameters (legacy)
     use_biased_sampler: bool = False,
     min_think_tokens: int = 50,
     max_think_tokens: int = 800,
@@ -1620,22 +1606,23 @@ def generate_grpo(
     force_close_after: int = 1000,
     custom_token_biases: Optional[Dict[int, Union[float, Dict]]] = None,
     sampler_verbose: bool = False,
-    # KV Cache Optimization (NEW)
+    # KV Cache Optimization
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     max_kv_size: Optional[int] = None,
-    # Optional tracking
+    # Tracking
     diversity_tracker: Optional[DiversityTracker] = None,
-    stats_tracker: Optional["StatisticsTracker"] = None,
+    stats_tracker: Optional[StatisticsTracker] = None,
     update_idx: int = 0,
 ) -> Tuple[List[mx.array], List[str], List[int]]:
     """
-    Generate completions with optional biased sampling.
+    Generate completions with multiple generation modes.
 
-    Modes:
-    1. Default (use_biased_sampler=False): Uses batch_generate (proven, fast)
-    2. Biased (use_biased_sampler=True): Uses BiasedSampler (thinking tag control)
+    Modes (in priority order):
+    1. Phased (use_phased_generation=True): Multi-phase constrained generation
+    2. Biased (use_biased_sampler=True): BiasedSampler for thinking tag control
+    3. Default: Uses batch_generate (proven, fast)
 
     Args:
         model: The language model
@@ -1646,10 +1633,10 @@ def generate_grpo(
         temperature: Sampling temperature
         batch_size: Batch size for generation
         end_token: Token to strip from completions
-        use_biased_sampler: Enable BiasedSampler (default: False)
-        [... biased sampler params ...]
-        diversity_tracker: Optional diversity tracker
-        update_idx: Current update index
+        use_phased_generation: Enable multi-phase generation (NEW)
+        generation_phases: Phase configurations (NEW)
+        use_biased_sampler: Enable BiasedSampler (legacy)
+        [... other params ...]
 
     Returns:
         all_completions: List of completion token arrays
@@ -1660,8 +1647,24 @@ def generate_grpo(
     model.eval()
 
     try:
-        if use_biased_sampler:
-            # NEW: BiasedSampler mode (thinking tag control)
+        if use_phased_generation:
+            # NEW: Phased generation mode
+            return _generate_with_phases(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_tokens=prompt_tokens,
+                max_tokens=max_tokens,
+                group_size=group_size,
+                batch_size=batch_size,
+                end_token=end_token,
+                phases=generation_phases,
+                verbose=phased_verbose,
+                diversity_tracker=diversity_tracker,
+                stats_tracker=stats_tracker,
+                update_idx=update_idx,
+            )
+        elif use_biased_sampler:
+            # Legacy: BiasedSampler mode
             return _generate_with_biased_sampler(
                 model=model,
                 tokenizer=tokenizer,
@@ -1688,7 +1691,7 @@ def generate_grpo(
                 update_idx=update_idx,
             )
         else:
-            # ORIGINAL: batch_generate mode (proven, default)
+            # Default: batch_generate mode
             return _generate_with_batch(
                 model=model,
                 tokenizer=tokenizer,
@@ -1702,26 +1705,108 @@ def generate_grpo(
                 top_k=top_k,
                 min_p=min_p,
                 min_tokens_to_keep=min_tokens_to_keep,
-                # MLX-LM Enhanced Sampling
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
                 logit_bias=logit_bias,
                 xtc_probability=xtc_probability,
                 xtc_threshold=xtc_threshold,
-                # KV Cache Optimization
                 kv_bits=kv_bits,
                 kv_group_size=kv_group_size,
                 quantized_kv_start=quantized_kv_start,
                 max_kv_size=max_kv_size,
-                # Tracking
                 diversity_tracker=diversity_tracker,
                 stats_tracker=stats_tracker,
                 update_idx=update_idx,
             )
     finally:
+        mx.eval([])
         mx.clear_cache()
         if was_training:
             model.train()
+
+
+def _generate_with_phases(
+    model: nn.Module,
+    tokenizer,
+    prompt_tokens: List[mx.array],
+    max_tokens: int,
+    group_size: int,
+    batch_size: int,
+    end_token: str,
+    phases: Optional[List[GenerationPhase]],
+    verbose: bool,
+    diversity_tracker: Optional[DiversityTracker],
+    stats_tracker: Optional[StatisticsTracker],
+    update_idx: int,
+) -> Tuple[List[mx.array], List[str], List[int]]:
+    """
+    Phased generation implementation for thinking models.
+
+    Executes multi-phase generation with phase-specific constraints.
+    """
+    all_completions = []
+    all_completion_texts = []
+    batch_indices = []
+
+    # Use default phases if not provided
+    if phases is None:
+        phases = get_default_thinking_phases()
+
+    total_samples = len(prompt_tokens)
+
+    for i in range(0, total_samples, batch_size):
+        current_batch_size = min(batch_size, total_samples - i)
+        batch_prompts = prompt_tokens[i : i + current_batch_size]
+
+        for j, prompt in enumerate(batch_prompts):
+            prompt_text = tokenizer.decode(prompt)
+            prompt_hash = hashlib.md5(prompt_text.encode()).hexdigest()
+
+            for k in range(group_size):
+                # Execute phased generation
+                completion, phase_outputs = generate_phased(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt_text,
+                    phases=phases,
+                    fallback_max_tokens=max_tokens,
+                    verbose=verbose,
+                )
+
+                # Convert to IDs
+                completion_ids = tokenizer.encode(completion)
+
+                # Strip end token if needed
+                if end_token:
+                    end_sequence = tokenizer.encode(end_token)
+                    if (
+                        len(completion_ids) >= len(end_sequence)
+                        and completion_ids[-len(end_sequence):] == end_sequence
+                    ):
+                        completion_ids = completion_ids[:-len(end_sequence)]
+
+                completion_ids = mx.array(completion_ids)
+                all_completions.append(mx.stop_gradient(completion_ids))
+                all_completion_texts.append(completion)
+                batch_indices.append(i + j)
+
+                # Track diversity
+                if diversity_tracker is not None:
+                    diversity_tracker.add_generation(
+                        update_idx, completion, prompt_hash
+                    )
+
+                # Track statistics
+                if stats_tracker is not None:
+                    stats_tracker.add_generation_stats(completion)
+
+    mx.eval(all_completions)
+    mx.clear_cache()
+
+    if not all_completions:
+        raise ValueError("No valid completions generated with phased generation.")
+
+    return all_completions, all_completion_texts, batch_indices
 
 
 def _generate_with_batch(
@@ -1737,21 +1822,18 @@ def _generate_with_batch(
     top_k: int,
     min_p: float,
     min_tokens_to_keep: int,
-    # MLX-LM Enhanced Sampling
-    repetition_penalty: float = 1.0,
-    repetition_context_size: int = 20,
-    logit_bias: Optional[Dict[int, float]] = None,
-    xtc_probability: float = 0.0,
-    xtc_threshold: float = 0.1,
-    # KV Cache Optimization
-    kv_bits: Optional[int] = None,
-    kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
-    max_kv_size: Optional[int] = None,
-    # Tracking
-    diversity_tracker: Optional[DiversityTracker] = None,
-    stats_tracker: Optional["StatisticsTracker"] = None,
-    update_idx: int = 0,
+    repetition_penalty: float,
+    repetition_context_size: int,
+    logit_bias: Optional[Dict[int, float]],
+    xtc_probability: float,
+    xtc_threshold: float,
+    kv_bits: Optional[int],
+    kv_group_size: int,
+    quantized_kv_start: int,
+    max_kv_size: Optional[int],
+    diversity_tracker: Optional[DiversityTracker],
+    stats_tracker: Optional[StatisticsTracker],
+    update_idx: int,
 ) -> Tuple[List[mx.array], List[str], List[int]]:
     """Original batch_generate implementation - proven and stable."""
     all_completions = []
@@ -1759,15 +1841,6 @@ def _generate_with_batch(
     batch_indices = []
 
     total_samples = len(prompt_tokens)
-
-    # Configure EOS token
-    use_eos_token = False
-    if end_token:
-        try:
-            tokenizer.add_eos_token(end_token)
-            use_eos_token = True
-        except ValueError:
-            use_eos_token = False
 
     for i in range(0, total_samples, batch_size):
         current_batch_size = min(batch_size, total_samples - i)
@@ -1796,31 +1869,19 @@ def _generate_with_batch(
             xtc_special_tokens=xtc_special_tokens,
         )
 
-        # Create logits processors (repetition penalty, logit bias)
-        logits_processors = make_logits_processors(
-            logit_bias=logit_bias,
-            repetition_penalty=repetition_penalty,
-            repetition_context_size=repetition_context_size,
-        )
+        # Generate batch with optional KV cache optimization
+        gen_kwargs = {}
+        if max_kv_size is not None:
+            gen_kwargs["max_kv_size"] = max_kv_size
 
-        # Generate batch with KV cache optimization
         results = batch_generate(
             model=model,
             tokenizer=tokenizer,
             prompts=batched_prompts,
             max_tokens=max_tokens,
             sampler=sampler,
-            # logits_processors=logits_processors if logits_processors else None,
             verbose=False,
-            # KV cache optimization (MLX-LM advanced features)
-            # Note: These are passed as kwargs and may not be supported in older mlx-lm versions
-            **(
-                {
-                    "max_kv_size": max_kv_size,
-                }
-                if max_kv_size is not None
-                else {}
-            ),
+            **gen_kwargs,
         )
 
         # Process results
@@ -1828,13 +1889,13 @@ def _generate_with_batch(
             completion_ids = tokenizer.encode(completion_text)
 
             # Strip end token if needed
-            if not use_eos_token and end_token:
+            if end_token:
                 end_sequence = tokenizer.encode(end_token)
                 if (
                     len(completion_ids) >= len(end_sequence)
-                    and completion_ids[-len(end_sequence) :] == end_sequence
+                    and completion_ids[-len(end_sequence):] == end_sequence
                 ):
-                    completion_ids = completion_ids[: -len(end_sequence)]
+                    completion_ids = completion_ids[:-len(end_sequence)]
 
             completion_ids = mx.array(completion_ids)
             all_completions.append(mx.stop_gradient(completion_ids))
@@ -1853,13 +1914,9 @@ def _generate_with_batch(
             if stats_tracker is not None:
                 stats_tracker.add_generation_stats(completion_text)
 
-            # Track statistics
-            if stats_tracker is not None:
-                stats_tracker.add_generation_stats(completion_text)
-
         # Memory cleanup
         del results
-        mx.eval(all_completions[-len(batched_prompts) :])
+        mx.eval(all_completions[-len(batched_prompts):])
         mx.clear_cache()
 
     if not all_completions:
@@ -1892,10 +1949,10 @@ def _generate_with_biased_sampler(
     custom_token_biases: Optional[Dict],
     sampler_verbose: bool,
     diversity_tracker: Optional[DiversityTracker],
-    stats_tracker: Optional["StatisticsTracker"],
+    stats_tracker: Optional[StatisticsTracker],
     update_idx: int,
 ) -> Tuple[List[mx.array], List[str], List[int]]:
-    """BiasedSampler implementation for thinking tag control."""
+    """BiasedSampler implementation for thinking tag control (legacy)."""
     all_completions = []
     all_completion_texts = []
     batch_indices = []
@@ -1911,7 +1968,7 @@ def _generate_with_biased_sampler(
             prompt_hash = hashlib.md5(prompt_text.encode()).hexdigest()
 
             for k in range(group_size):
-                # Create base sampler with CONFIGURABLE parameters (NO HARDCODING!)
+                # Create base sampler
                 base_sampler = make_sampler(
                     temperature,
                     top_p=top_p,
@@ -1934,7 +1991,7 @@ def _generate_with_biased_sampler(
                     verbose=sampler_verbose,
                 )
 
-                # TWO-STAGE GENERATION: thinking → answer
+                # Create prompt cache for efficiency
                 prompt_cache = mlx_cache.make_prompt_cache(model)
 
                 # Stage 1: Generate thinking until </think>
@@ -1949,17 +2006,15 @@ def _generate_with_biased_sampler(
                     prompt_cache=prompt_cache,
                 )
 
-                # CRITICAL: Truncate at </think> to remove repetition garbage
+                # Truncate at </think> to remove repetition garbage
                 if "</think>" in thinking_completion:
-                    think_end_pos = thinking_completion.find("</think>") + len(
-                        "</think>"
-                    )
+                    think_end_pos = thinking_completion.find("</think>") + len("</think>")
                     thinking_completion = thinking_completion[:think_end_pos]
 
                     if sampler_verbose:
                         logger.info(f"Truncated thinking at position {think_end_pos}")
 
-                # Stage 2: Continue generating answer (if </think> present)
+                # Stage 2: Continue generating answer (reuse cache)
                 if "</think>" in thinking_completion:
                     # Create answer sampler WITHOUT thinking bias
                     answer_sampler = make_sampler(
@@ -1970,7 +2025,7 @@ def _generate_with_biased_sampler(
                         top_k=top_k,
                     )
 
-                    # Continue from where thinking left off
+                    # Continue from where thinking left off (reuse cache)
                     full_prompt = prompt_text + thinking_completion
                     answer_max_tokens = max(
                         500, max_tokens - len(tokenizer.encode(thinking_completion))
@@ -1983,35 +2038,35 @@ def _generate_with_biased_sampler(
                         max_tokens=answer_max_tokens,
                         verbose=False,
                         sampler=answer_sampler,
-                        prompt_cache=None,  # Fresh cache
+                        prompt_cache=prompt_cache,  # Reuse cache
                     )
 
-                    # Extract just the new answer part (not full_prompt)
-                    # MLX-LM generate() returns only the generated tokens, not the prompt
                     completion = thinking_completion + answer_completion
                     del answer_sampler
                 else:
-                    # No </think> found, use as-is
                     completion = thinking_completion
                     if sampler_verbose:
                         logger.warning(
                             f"No </think> tag found in completion (length: {len(thinking_completion)})"
                         )
 
+                # Cleanup prompt cache
+                del prompt_cache
+
                 # Convert to IDs
                 if isinstance(completion, str):
                     completion_ids = tokenizer.encode(completion)
                 else:
-                    completion_ids = completion
+                    completion_ids = list(completion)
 
                 # Strip end token
                 if end_token:
                     end_sequence = tokenizer.encode(end_token)
                     if (
                         len(completion_ids) >= len(end_sequence)
-                        and completion_ids[-len(end_sequence) :] == end_sequence
+                        and completion_ids[-len(end_sequence):] == end_sequence
                     ):
-                        completion_ids = completion_ids[: -len(end_sequence)]
+                        completion_ids = completion_ids[:-len(end_sequence)]
 
                 completion_ids = mx.array(completion_ids)
                 all_completions.append(mx.stop_gradient(completion_ids))
@@ -2028,10 +2083,8 @@ def _generate_with_biased_sampler(
                 if stats_tracker is not None:
                     stats_tracker.add_generation_stats(completion)
 
-                # Cleanup
-                del prompt_cache
-
-            del sampler
+                # Cleanup sampler
+                del sampler
 
     mx.eval(all_completions)
     mx.clear_cache()
@@ -2047,7 +2100,7 @@ def calculate_rewards_and_advantages(
     expanded_prompts: List[str],
     all_completion_texts: List[str],
     expanded_answers: List[str],
-    expanded_types: List,
+    expanded_types: List[Any],
     batch_indices: List[int],
     unique_prompt_indices: List[int],
     reward_weights: Optional[List[float]] = None,
@@ -2094,7 +2147,7 @@ def calculate_rewards_and_advantages(
     # Validate rewards
     all_nan_rows = mx.all(mx.isnan(rewards), axis=1)
     if mx.any(all_nan_rows):
-        nan_row_idx = mx.argmax(all_nan_rows).item()
+        nan_row_idx = int(mx.argmax(all_nan_rows).item())
         raise RuntimeError(
             f"All reward functions returned None for prompt: {expanded_prompts[nan_row_idx]}, "
             f"completion: {all_completion_texts[nan_row_idx]}, "
@@ -2109,36 +2162,36 @@ def calculate_rewards_and_advantages(
                 f"Reward weights ({len(reward_weights)}) must match "
                 f"reward functions ({len(reward_funcs)})"
             )
-        reward_weights = mx.array(reward_weights, dtype=mx.float32)
+        weight_array = mx.array(reward_weights, dtype=mx.float32)
     else:
-        reward_weights = mx.ones(len(reward_funcs), dtype=mx.float32)
+        weight_array = mx.ones(len(reward_funcs), dtype=mx.float32)
 
     # Combine rewards
     valid_reward_mask = ~mx.isnan(rewards)
     rewards_no_nan = mx.where(valid_reward_mask, rewards, mx.zeros_like(rewards))
-    rewards = (rewards_no_nan * mx.expand_dims(reward_weights, 0)).sum(axis=1)
+    combined_rewards = (rewards_no_nan * mx.expand_dims(weight_array, 0)).sum(axis=1)
 
     # Group rewards by prompt
     num_unique_prompts = len(unique_prompt_indices)
-    rewards_by_prompt = [[] for _ in range(num_unique_prompts)]
+    rewards_by_prompt: List[List[float]] = [[] for _ in range(num_unique_prompts)]
     for i, prompt_idx in enumerate(batch_indices):
         prompt_position = unique_prompt_indices.index(prompt_idx)
-        rewards_by_prompt[prompt_position].append(rewards[i])
+        rewards_by_prompt[prompt_position].append(float(combined_rewards[i]))
 
     # Calculate advantages
-    advantages = mx.zeros_like(rewards)
+    advantages = mx.zeros_like(combined_rewards)
     for i, prompt_rewards in enumerate(rewards_by_prompt):
         if len(prompt_rewards) > 1:
-            prompt_rewards = mx.array(prompt_rewards)
-            mean_reward = mx.mean(prompt_rewards)
-            std_reward = mx.std(prompt_rewards)
+            prompt_rewards_arr = mx.array(prompt_rewards)
+            mean_reward = mx.mean(prompt_rewards_arr)
+            std_reward = mx.std(prompt_rewards_arr)
             indices = [
                 j
                 for j, idx in enumerate(batch_indices)
                 if idx == unique_prompt_indices[i]
             ]
             for j, idx in enumerate(indices):
-                advantages[idx] = (prompt_rewards[j] - mean_reward) / (
+                advantages[idx] = (prompt_rewards_arr[j] - mean_reward) / (
                     std_reward + 1e-4
                 )
         else:
@@ -2146,36 +2199,27 @@ def calculate_rewards_and_advantages(
             advantages[idx] = 0.0
 
     # Calculate reward metrics
-    reward_metrics = {}
+    reward_metrics: Dict[str, Any] = {}
     for i, reward_func in enumerate(reward_funcs):
         func_name = reward_func.__name__
         raw_rewards = reward_func(
             prompts=expanded_prompts,
             completions=all_completion_texts,
             answer=expanded_answers,
+            types=expanded_types,
         )
-        valid_mask = ~mx.isnan(
-            mx.array(
-                [
-                    reward if reward is not None else float("nan")
-                    for reward in raw_rewards
-                ]
-            )
-        )
-        valid_rewards = mx.array(
-            [
-                reward
-                for reward in raw_rewards
-                if reward is not None and not mx.isnan(reward)
-            ]
-        )
-        if len(valid_rewards) > 0:
-            reward_metrics[f"{func_name}_mean"] = mx.mean(valid_rewards)
+        valid_rewards = [
+            float(r)
+            for r in (raw_rewards or [])
+            if r is not None and not np.isnan(r)
+        ]
+        if valid_rewards:
+            reward_metrics[f"{func_name}_mean"] = float(np.mean(valid_rewards))
             reward_metrics[f"{func_name}_std"] = (
-                mx.std(valid_rewards) if len(valid_rewards) > 1 else mx.zeros(1)
+                float(np.std(valid_rewards)) if len(valid_rewards) > 1 else 0.0
             )
-            reward_metrics[f"{func_name}_coverage"] = valid_mask.sum() / len(
-                raw_rewards
+            reward_metrics[f"{func_name}_coverage"] = len(valid_rewards) / len(
+                all_completion_texts
             )
         else:
             reward_metrics[f"{func_name}_mean"] = float("nan")
@@ -2183,22 +2227,17 @@ def calculate_rewards_and_advantages(
             reward_metrics[f"{func_name}_coverage"] = 0.0
 
     # Grouped reward statistics
-    grouped_rewards_mean = mx.array(
-        [mx.mean(mx.array(rewards)) for rewards in rewards_by_prompt]
-    )
-    grouped_rewards_std = mx.array(
-        [
-            mx.std(mx.array(rewards)) if len(rewards) > 1 else mx.zeros(1)
-            for rewards in rewards_by_prompt
-        ]
-    )
+    grouped_rewards_mean = [np.mean(rewards) for rewards in rewards_by_prompt]
+    grouped_rewards_std = [
+        np.std(rewards) if len(rewards) > 1 else 0.0 for rewards in rewards_by_prompt
+    ]
 
     # Aggregate metrics
     reward_specific_metrics = {
-        "total_rewards_mean": mx.mean(rewards),
-        "total_rewards_std": mx.std(rewards),
-        "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
-        "grouped_rewards_std": mx.mean(grouped_rewards_std),
+        "total_rewards_mean": float(mx.mean(combined_rewards)),
+        "total_rewards_std": float(mx.std(combined_rewards)),
+        "grouped_rewards_mean": float(np.mean(grouped_rewards_mean)),
+        "grouped_rewards_std": float(np.mean(grouped_rewards_std)),
         **reward_metrics,
     }
 
@@ -2206,27 +2245,27 @@ def calculate_rewards_and_advantages(
 
 
 def grpo_loss(
-    model,
-    ref_model,
-    batch,
-    completions=None,
-    completion_texts=None,
-    batch_indices=None,
-    advantages=None,
-    reward_metrics=None,
+    model: nn.Module,
+    ref_model: Optional[nn.Module],
+    batch: Tuple,
+    completions: Optional[List[mx.array]] = None,
+    completion_texts: Optional[List[str]] = None,
+    batch_indices: Optional[List[int]] = None,
+    advantages: Optional[mx.array] = None,
+    reward_metrics: Optional[Dict[str, Any]] = None,
     beta: float = 0.1,
     epsilon: float = 1e-4,
-    epsilon_high: float = None,
+    epsilon_high: Optional[float] = None,
     max_tokens: int = 64,
-    importance_sampling_level: str = "token",
+    importance_sampling_level: Optional[str] = "token",
     grpo_loss_type: str = "grpo",
     use_compilation: bool = False,
-    # Sample logging (OPTIONAL)
+    # Sample logging
     jsonl_logger: Optional[JSONLLogger] = None,
     iteration: int = 0,
     update_counter: int = 0,
     log_samples: bool = False,
-):
+) -> Tuple[mx.array, mx.array, Dict[str, Any]]:
     """
     GRPO loss function with optional compilation.
 
@@ -2246,16 +2285,23 @@ def grpo_loss(
         importance_sampling_level: 'token', 'sequence', or None
         grpo_loss_type: 'grpo', 'bnpo', or 'dr_grpo'
         use_compilation: Use compiled log prob computation (7x faster)
+        jsonl_logger: Optional logger for samples
+        iteration: Current iteration
+        update_counter: Gradient update counter
+        log_samples: Whether to log samples
 
     Returns:
         loss: Computed loss
         ntokens: Number of tokens
         metrics: Dictionary of metrics
     """
-    _, _, prompt_text, answer_text, type_info = batch
+    prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
     if not completions:
         raise ValueError("No completions provided to grpo_loss")
+
+    if reward_metrics is None:
+        reward_metrics = {}
 
     # Prepare padded completions
     max_length = max(ids.shape[0] for ids in completions)
@@ -2281,7 +2327,7 @@ def grpo_loss(
     attention_mask = mx.stack(attention_masks)
     lengths = attention_mask.sum(axis=1)
 
-    # Get log probabilities (with optional compilation)
+    # Get log probabilities
     policy_logps_list, policy_compiled = get_per_token_logps(
         model, inputs, lengths, use_compilation
     )
@@ -2340,12 +2386,12 @@ def grpo_loss(
 
     # PPO-style clipping
     coef_1 = mx.exp(log_importance_weights)
-    epsilon_high = epsilon_high if epsilon_high else epsilon
-    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
+    epsilon_high_val = epsilon_high if epsilon_high else epsilon
+    coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high_val)
 
     # Clipping metrics
     is_low_clipped = (coef_1 < 1 - epsilon) & (advantages.reshape(-1, 1) < 0)
-    is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages.reshape(-1, 1) > 0)
+    is_high_clipped = (coef_1 > 1 + epsilon_high_val) & (advantages.reshape(-1, 1) > 0)
     is_region_clipped = is_low_clipped | is_high_clipped
 
     # Compute objectives
@@ -2379,7 +2425,7 @@ def grpo_loss(
         raise ValueError(f"Unknown loss type: {grpo_loss_type}")
 
     # Metrics
-    mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
+    mean_kl = ((kl_div * length_mask).sum(axis=1) / mx.maximum(length_mask.sum(axis=1), 1.0)).mean()
 
     # Generation statistics
     completion_lengths = [comp.shape[0] for comp in completions]
@@ -2393,6 +2439,8 @@ def grpo_loss(
         hit_max_tokens / len(completion_lengths) if completion_lengths else 0
     )
 
+    length_mask_sum = float(length_mask.sum())
+
     metrics = {
         "kl": mean_kl,
         "average_generated_tokens": avg_generated,
@@ -2400,44 +2448,41 @@ def grpo_loss(
         "min_generated_tokens": min_generated,
         "hit_max_tokens_ratio": hit_max_ratio,
         "clip_ratio_low": (
-            (is_low_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
+            float((is_low_clipped * length_mask).sum()) / length_mask_sum
+            if length_mask_sum > 0
+            else 0.0
         ),
         "clip_ratio_high": (
-            (is_high_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
+            float((is_high_clipped * length_mask).sum()) / length_mask_sum
+            if length_mask_sum > 0
+            else 0.0
         ),
         "clip_ratio_total": (
-            (is_region_clipped * length_mask).sum() / length_mask.sum()
-            if length_mask.sum() > 0
-            else mx.zeros(1)
+            float((is_region_clipped * length_mask).sum()) / length_mask_sum
+            if length_mask_sum > 0
+            else 0.0
         ),
         **reward_metrics,
     }
 
-    # Log samples if requested (COMPREHENSIVE TRACKING)
-    if log_samples and jsonl_logger is not None:
-        _, _, prompt_text, answer_text, _ = batch
+    # Log samples if requested
+    if log_samples and jsonl_logger is not None and completion_texts is not None:
         unique_prompt_indices = sorted(set(batch_indices))
 
         # Compute per-sequence KL
-        per_seq_kl = (kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)
-
-        # Get actual rewards (not advantages) - reconstruct from advantages
-        # advantages = (reward - mean) / std, so we need the original rewards
-        # We'll compute group stats from advantages and metrics
+        per_seq_kl = (kl_div * length_mask).sum(axis=1) / mx.maximum(
+            length_mask.sum(axis=1), 1.0
+        )
 
         for prompt_idx in unique_prompt_indices:
             prompt_completions = []
             prompt_rewards = []
-            prompt_advantages = []
+            prompt_advantages_list = []
             prompt_kls = []
 
             for i, idx in enumerate(batch_indices):
                 if idx == prompt_idx:
-                    comp_reward = float(advantages[i])  # Using advantage as proxy
+                    comp_adv = float(advantages[i])
                     comp_kl = float(per_seq_kl[i])
                     comp_length = len(completion_texts[i])
 
@@ -2445,59 +2490,62 @@ def grpo_loss(
                         {
                             "completion": completion_texts[i],
                             "completion_length": comp_length,
-                            "reward": comp_reward,  # Note: this is advantage, need actual reward
-                            "advantage": comp_reward,
+                            "advantage": comp_adv,
                             "kl": comp_kl,
                         }
                     )
-                    prompt_rewards.append(comp_reward)
-                    prompt_advantages.append(comp_reward)
+                    prompt_rewards.append(comp_adv)
+                    prompt_advantages_list.append(comp_adv)
                     prompt_kls.append(comp_kl)
 
             if prompt_completions:
-                # Compute group statistics
                 group_stats = {
-                    "reward_mean": float(np.mean(prompt_rewards)),
-                    "reward_std": float(np.std(prompt_rewards)),
-                    "reward_min": float(np.min(prompt_rewards)),
-                    "reward_max": float(np.max(prompt_rewards)),
-                    "advantage_mean": float(np.mean(prompt_advantages)),
-                    "advantage_std": float(np.std(prompt_advantages)),
+                    "advantage_mean": float(np.mean(prompt_advantages_list)),
+                    "advantage_std": float(np.std(prompt_advantages_list)),
                     "kl_mean": float(np.mean(prompt_kls)),
                     "kl_max": float(np.max(prompt_kls)),
                 }
 
-                # Log with comprehensive information
                 jsonl_logger.log(
                     {
-                        "iteration": iteration,  # Training iteration number
-                        "update": update_counter,  # Gradient update counter
+                        "iteration": iteration,
+                        "update": update_counter,
                         "prompt": prompt_text[prompt_idx],
                         "answer": answer_text[prompt_idx],
-                        "type": None,  # Can be added if type info available
                         "group_size": len(prompt_completions),
                         "completions": prompt_completions,
                         "group_stats": group_stats,
                         "hyperparameters": {
                             "beta": beta,
                             "epsilon": epsilon,
-                            "epsilon_high": epsilon_high if epsilon_high else epsilon,
-                            "temperature": None,  # Not available in loss function
-                            "kl_direction": "forward",  # Based on KL computation
+                            "epsilon_high": epsilon_high_val,
                         },
                     }
                 )
 
+    mx.eval(loss)
     mx.clear_cache()
 
     return loss, length_mask.sum(axis=1).sum(), metrics
 
 
-def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
+def iterate_grpo_batches(
+    dataset: List,
+    batch_size: int,
+    max_seq_length: int,
+    train: bool = False,
+):
     """
-    Iterate over GRPO batches with FIXED iterator bug.
+    Iterate over GRPO batches with proper iterator handling.
 
-    CRITICAL FIX: Proper iteration control - no iterator exhaustion.
+    Args:
+        dataset: List of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples
+        batch_size: Batch size
+        max_seq_length: Maximum sequence length
+        train: If True, iterate infinitely with shuffling
+
+    Yields:
+        Batches of (prompts_tokens, answers_tokens, prompts_text, answers_text, types)
     """
     has_types = isinstance(dataset[0], tuple) and len(dataset[0]) == 5
 
@@ -2510,7 +2558,7 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
             "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples"
         )
 
-    def length_key(i):
+    def length_key(i: int) -> int:
         return len(dataset[i][0]) + len(dataset[i][1])
 
     idx = sorted(range(len(dataset)), key=length_key)
@@ -2527,11 +2575,9 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
         for i in range(0, len(idx) - batch_size + 1, batch_size):
             yield idx[i : i + batch_size : step]
 
-    # CRITICAL FIX: Proper iteration control
     if train:
         # Infinite iteration with shuffling
         while True:
-            # Create list ONCE per epoch
             indices = list(batch_index_generator())
             np.random.shuffle(indices)
 
@@ -2562,13 +2608,13 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
 def evaluate_grpo(
     model: nn.Module,
     ref_model: Optional[nn.Module],
-    dataset,
+    dataset: List,
     tokenizer,
-    batch_size,
-    num_batches,
+    batch_size: int,
+    num_batches: int,
     beta: float,
     epsilon: float,
-    epsilon_high: float,
+    epsilon_high: Optional[float],
     group_size: int,
     max_seq_length: int,
     max_tokens: int,
@@ -2578,20 +2624,24 @@ def evaluate_grpo(
     loss_fn: Callable = grpo_loss,
     iterate_batches: Callable = iterate_grpo_batches,
     grpo_loss_type: str = "grpo",
-    importance_sampling_level: str = "token",
+    importance_sampling_level: Optional[str] = "token",
     end_answer_token: str = "</answer>",
     use_compilation: bool = False,
-    # Sampler parameters (NO HARDCODING!)
+    # Sampler parameters
     top_p: float = 0.95,
     top_k: int = 20,
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
-    # MLX-LM Enhanced Sampling (NEW)
+    # MLX-LM Enhanced Sampling
     repetition_penalty: float = 1.0,
     repetition_context_size: int = 20,
     logit_bias: Optional[Dict[int, float]] = None,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
+    # Phased generation
+    use_phased_generation: bool = False,
+    generation_phases: Optional[List[GenerationPhase]] = None,
+    phased_verbose: bool = False,
     # BiasedSampler parameters
     use_biased_sampler: bool = False,
     min_think_tokens: int = 50,
@@ -2600,12 +2650,12 @@ def evaluate_grpo(
     think_close_bias_value: float = 3.0,
     think_close_bias_decay: float = 0.995,
     force_close_after: int = 1000,
-    # KV Cache Optimization (NEW)
+    # KV Cache Optimization
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     max_kv_size: Optional[int] = None,
-):
+) -> Tuple[float, int, Dict[str, Any]]:
     """Evaluate GRPO model with optional advanced features."""
     # Default reward functions if not provided
     if reward_funcs is None:
@@ -2617,9 +2667,9 @@ def evaluate_grpo(
             r1_count_xml,
         ]
 
-    all_losses = 0
+    all_losses = 0.0
     ntokens = 0
-    all_metrics = None
+    all_metrics: Optional[Dict[str, Any]] = None
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
@@ -2633,7 +2683,7 @@ def evaluate_grpo(
     ):
         prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
-        # Generate completions with ALL parameters (NO HARDCODING!)
+        # Generate completions
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             tokenizer=tokenizer,
@@ -2643,23 +2693,18 @@ def evaluate_grpo(
             temperature=temperature,
             batch_size=batch_size,
             end_token=end_answer_token,
-            # Sampler parameters
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
             min_tokens_to_keep=min_tokens_to_keep,
-            # MLX-LM Enhanced Sampling
             repetition_penalty=repetition_penalty,
             repetition_context_size=repetition_context_size,
             logit_bias=logit_bias,
             xtc_probability=xtc_probability,
             xtc_threshold=xtc_threshold,
-            # KV Cache Optimization
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            quantized_kv_start=quantized_kv_start,
-            max_kv_size=max_kv_size,
-            # BiasedSampler parameters
+            use_phased_generation=use_phased_generation,
+            generation_phases=generation_phases,
+            phased_verbose=phased_verbose,
             use_biased_sampler=use_biased_sampler,
             min_think_tokens=min_think_tokens,
             max_think_tokens=max_think_tokens,
@@ -2667,6 +2712,10 @@ def evaluate_grpo(
             think_close_bias_value=think_close_bias_value,
             think_close_bias_decay=think_close_bias_decay,
             force_close_after=force_close_after,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+            max_kv_size=max_kv_size,
         )
 
         # Prepare expanded data
@@ -2674,7 +2723,7 @@ def evaluate_grpo(
         expanded_prompts = []
         expanded_types = []
         unique_prompt_indices = sorted(set(batch_indices))
-        grouped_completions = {idx: [] for idx in unique_prompt_indices}
+        grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
 
         for i, completion_idx in enumerate(batch_indices):
             grouped_completions[completion_idx].append(i)
@@ -2730,27 +2779,31 @@ def evaluate_grpo(
         del all_completions, all_completion_texts, batch_indices
         del ordered_completions, ordered_completion_texts, ordered_batch_indices
         del advantages, reward_metrics
+        mx.eval(losses, toks)
         mx.clear_cache()
 
-        all_losses += losses * toks
-        ntokens += toks
+        all_losses += float(losses) * float(toks)
+        ntokens += int(toks)
 
         if all_metrics is None:
-            all_metrics = {k: v * toks for k, v in metrics.items()}
+            all_metrics = {k: float(v) * float(toks) for k, v in metrics.items()}
         else:
             for k, v in metrics.items():
-                all_metrics[k] += v * toks
+                all_metrics[k] += float(v) * float(toks)
 
-    mx.eval(all_losses, ntokens)
+    # Distributed reduction
+    all_losses_arr = mx.array(all_losses)
+    ntokens_arr = mx.array(ntokens)
+    mx.eval(all_losses_arr, ntokens_arr)
 
-    all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
-    ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
-    all_metrics = {k: mx.distributed.all_sum(v) for k, v in all_metrics.items()}
+    all_losses_sum = mx.distributed.all_sum(all_losses_arr, stream=mx.cpu)
+    ntokens_sum = mx.distributed.all_sum(ntokens_arr, stream=mx.cpu)
+    all_metrics_sum = {k: mx.distributed.all_sum(mx.array(v)) for k, v in all_metrics.items()}
 
-    avg_metrics = {k: (v / ntokens).item() for k, v in all_metrics.items()}
-    avg_loss = (all_losses / ntokens).item()
+    avg_metrics = {k: float(v) / float(ntokens_sum) for k, v in all_metrics_sum.items()}
+    avg_loss = float(all_losses_sum) / float(ntokens_sum)
 
-    return avg_loss, ntokens, avg_metrics
+    return avg_loss, int(ntokens_sum), avg_metrics
 
 
 def train_grpo(
@@ -2758,13 +2811,13 @@ def train_grpo(
     ref_model: Optional[nn.Module],
     tokenizer,
     optimizer,
-    train_dataset,
-    val_dataset,
+    train_dataset: List,
+    val_dataset: List,
     reward_funcs: Optional[List[RewardFunctions]] = None,
-    args: GRPOTrainingArgs = GRPOTrainingArgs(),
+    args: GRPOTrainingArgs = None,
     loss_fn: Callable = grpo_loss,
     iterate_batches: Callable = iterate_grpo_batches,
-    training_callback: TrainingCallback = None,
+    training_callback: Optional[TrainingCallback] = None,
     end_answer_token: str = "</answer>",
 ):
     """
@@ -2772,12 +2825,16 @@ def train_grpo(
 
     This implementation combines:
     - Clean, proven architecture
+    - Optional phased generation for thinking models
     - Optional BiasedSampler for thinking tag control
     - Optional compilation for 7x speedup
     - Optional diversity/KL spike tracking
     - EXCEPTIONAL logging format (best-in-class)
     - Professional error handling
     """
+    if args is None:
+        args = GRPOTrainingArgs()
+
     # Default reward functions if not provided
     if reward_funcs is None:
         reward_funcs = [
@@ -2796,10 +2853,26 @@ def train_grpo(
     if world_size > 1:
         tqdm.write(f"Node {rank} of {world_size}")
 
+    # Parse generation phases if provided
+    generation_phases: Optional[List[GenerationPhase]] = None
+    if args.use_phased_generation:
+        if args.generation_phases:
+            generation_phases = [
+                GenerationPhase.from_dict(p) for p in args.generation_phases
+            ]
+        else:
+            generation_phases = get_default_thinking_phases(
+                thinking_max_tokens=args.phased_thinking_max_tokens,
+                answer_max_tokens=args.phased_answer_max_tokens,
+                thinking_temperature=args.phased_thinking_temperature,
+                answer_temperature=args.phased_answer_temperature,
+                min_thinking_tokens=args.phased_min_thinking_tokens,
+            )
+
     # Display configuration
     if rank == 0:
         tqdm.write("=" * 80)
-        tqdm.write("GRPO TRAINING - ULTIMATE OPTIMIZED (ALL FEATURES ENABLED)")
+        tqdm.write("GRPO TRAINING - HYBRID PROFESSIONAL EDITION")
         tqdm.write("=" * 80)
         tqdm.write(
             f"✓ Compilation: {'ENABLED (7x faster)' if args.use_compilation else 'DISABLED'}"
@@ -2812,8 +2885,13 @@ def train_grpo(
         )
         tqdm.write(f"✓ Sample Logging: {'ENABLED' if args.log_samples else 'DISABLED'}")
         tqdm.write(f"✓ WandB Logging: {'ENABLED' if args.use_wandb else 'DISABLED'}")
-        if args.use_biased_sampler:
-            tqdm.write(f"✓ BiasedSampler: ENABLED")
+        if args.use_phased_generation:
+            tqdm.write(f"✓ Phased Generation: ENABLED")
+            if generation_phases:
+                for phase in generation_phases:
+                    tqdm.write(f"  - {phase.name}: max={phase.max_tokens}, temp={phase.temperature}")
+        elif args.use_biased_sampler:
+            tqdm.write(f"✓ BiasedSampler: ENABLED (legacy)")
             tqdm.write(f"  - Min think: {args.min_think_tokens} tokens")
             tqdm.write(f"  - Max think: {args.max_think_tokens} tokens")
             tqdm.write(f"  - Force close: {args.force_close_after} tokens")
@@ -2826,7 +2904,7 @@ def train_grpo(
             import wandb
 
             # Auto-generate run name if not provided
-            run_name = f"{args.wandb_run_name}_{args.seed})" or f"grpo_{time.strftime('%Y%m%d_%H%M%S')}"
+            run_name = args.wandb_run_name or f"grpo_{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
 
             wandb_run = wandb.init(
                 project=args.wandb_project,
@@ -2845,9 +2923,9 @@ def train_grpo(
                     else None,
                     "iters": args.iters,
                     "use_compilation": args.use_compilation,
+                    "use_phased_generation": args.use_phased_generation,
                     "use_biased_sampler": args.use_biased_sampler,
                     "grpo_loss_type": args.grpo_loss_type,
-                    "full_args": args
                 },
             )
             tqdm.write(f"✓ WandB initialized: {wandb_run.url}")
@@ -2863,10 +2941,10 @@ def train_grpo(
     kl_spike_tracker = (
         KLSpikeTracker(args.kl_spike_threshold) if args.track_kl_spikes else None
     )
-    stats_tracker = StatisticsTracker()  # Always enabled for comprehensive stats
+    stats_tracker = StatisticsTracker()
 
     # Initialize sample logger
-    jsonl_logger = None
+    jsonl_logger: Optional[JSONLLogger] = None
     if args.log_samples:
         log_path = (
             Path(args.log_samples_path)
@@ -2897,7 +2975,7 @@ def train_grpo(
 
     state = [model.state, optimizer.state, mx.random.state]
 
-    # Training step update counter for diversity tracking
+    # Training step update counter
     update_counter = 0
 
     def step(batch, prev_grad, do_update, iteration):
@@ -2906,11 +2984,7 @@ def train_grpo(
         mx.clear_cache()
         prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
-        # Update counter BEFORE generation (for diversity tracking)
-        if do_update:
-            update_counter += 1
-
-        # Generate completions with ALL parameters from args (NO HARDCODING!)
+        # Generate completions
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             tokenizer=tokenizer,
@@ -2920,23 +2994,18 @@ def train_grpo(
             temperature=args.temperature,
             batch_size=args.batch_size,
             end_token=end_answer_token,
-            # Sampler parameters (from args, not hardcoded)
             top_p=args.top_p,
             top_k=args.top_k,
             min_p=args.min_p,
             min_tokens_to_keep=args.min_tokens_to_keep,
-            # MLX-LM Enhanced Sampling
             repetition_penalty=args.repetition_penalty,
             repetition_context_size=args.repetition_context_size,
             logit_bias=args.logit_bias,
             xtc_probability=args.xtc_probability,
             xtc_threshold=args.xtc_threshold,
-            # KV Cache Optimization
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            max_kv_size=args.max_kv_size,
-            # BiasedSampler parameters
+            use_phased_generation=args.use_phased_generation,
+            generation_phases=generation_phases,
+            phased_verbose=args.phased_verbose,
             use_biased_sampler=args.use_biased_sampler,
             min_think_tokens=args.min_think_tokens,
             max_think_tokens=args.max_think_tokens,
@@ -2945,7 +3014,10 @@ def train_grpo(
             think_close_bias_decay=args.think_close_bias_decay,
             force_close_after=args.force_close_after,
             sampler_verbose=args.sampler_verbose,
-            # Tracking
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            max_kv_size=args.max_kv_size,
             diversity_tracker=diversity_tracker,
             stats_tracker=stats_tracker,
             update_idx=update_counter,
@@ -2956,7 +3028,7 @@ def train_grpo(
         expanded_prompts = []
         expanded_types = []
         unique_prompt_indices = sorted(set(batch_indices))
-        grouped_completions = {idx: [] for idx in unique_prompt_indices}
+        grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
 
         for i, completion_idx in enumerate(batch_indices):
             grouped_completions[completion_idx].append(i)
@@ -3012,10 +3084,9 @@ def train_grpo(
             importance_sampling_level=args.importance_sampling_level,
             max_tokens=args.max_completion_length,
             use_compilation=args.use_compilation,
-            # Sample logging - pass both iteration and update counter
             jsonl_logger=jsonl_logger,
-            iteration=iteration,  # Training iteration
-            update_counter=update_counter,  # Gradient update counter
+            iteration=iteration,
+            update_counter=update_counter,
             log_samples=should_log_samples,
         )
 
@@ -3031,6 +3102,7 @@ def train_grpo(
 
         # Apply gradients
         if do_update:
+            update_counter += 1
             grad = average_gradients(grad)
             if grad_accum_steps > 1:
                 grad = tree_map(lambda x: x / grad_accum_steps, grad)
@@ -3047,33 +3119,33 @@ def train_grpo(
     loss_value_and_grad = nn.value_and_grad(model, loss_fn)
 
     model.train()
-    losses = 0
+    losses = 0.0
     n_tokens = 0
     steps = 0
     trained_tokens = 0
 
     # Initialize metric accumulators
-    accumulated_metrics = {
-        "total_rewards_mean": 0,
-        "total_rewards_std": 0,
-        "grouped_rewards_mean": 0,
-        "grouped_rewards_std": 0,
-        "kl": 0,
-        "average_generated_tokens": 0,
-        "max_generated_tokens": 0,
-        "min_generated_tokens": 0,
-        "hit_max_tokens_ratio": 0,
-        "clip_ratio_low": 0,
-        "clip_ratio_high": 0,
-        "clip_ratio_total": 0,
+    accumulated_metrics: Dict[str, float] = {
+        "total_rewards_mean": 0.0,
+        "total_rewards_std": 0.0,
+        "grouped_rewards_mean": 0.0,
+        "grouped_rewards_std": 0.0,
+        "kl": 0.0,
+        "average_generated_tokens": 0.0,
+        "max_generated_tokens": 0.0,
+        "min_generated_tokens": 0.0,
+        "hit_max_tokens_ratio": 0.0,
+        "clip_ratio_low": 0.0,
+        "clip_ratio_high": 0.0,
+        "clip_ratio_total": 0.0,
     }
 
     # Add reward-specific metrics
     for reward_func in reward_funcs:
         func_name = reward_func.__name__
-        accumulated_metrics[f"{func_name}_mean"] = 0
-        accumulated_metrics[f"{func_name}_std"] = 0
-        accumulated_metrics[f"{func_name}_coverage"] = 0
+        accumulated_metrics[f"{func_name}_mean"] = 0.0
+        accumulated_metrics[f"{func_name}_std"] = 0.0
+        accumulated_metrics[f"{func_name}_coverage"] = 0.0
 
     grad_accum = None
 
@@ -3113,23 +3185,18 @@ def train_grpo(
                 grpo_loss_type=args.grpo_loss_type,
                 end_answer_token=end_answer_token,
                 use_compilation=args.use_compilation,
-                # Sampler parameters (from args, not hardcoded)
                 top_p=args.top_p,
                 top_k=args.top_k,
                 min_p=args.min_p,
                 min_tokens_to_keep=args.min_tokens_to_keep,
-                # MLX-LM Enhanced Sampling
                 repetition_penalty=args.repetition_penalty,
                 repetition_context_size=args.repetition_context_size,
                 logit_bias=args.logit_bias,
                 xtc_probability=args.xtc_probability,
                 xtc_threshold=args.xtc_threshold,
-                # KV Cache Optimization
-                kv_bits=args.kv_bits,
-                kv_group_size=args.kv_group_size,
-                quantized_kv_start=args.quantized_kv_start,
-                max_kv_size=args.max_kv_size,
-                # BiasedSampler parameters
+                use_phased_generation=args.use_phased_generation,
+                generation_phases=generation_phases,
+                phased_verbose=args.phased_verbose,
                 use_biased_sampler=args.use_biased_sampler,
                 min_think_tokens=args.min_think_tokens,
                 max_think_tokens=args.max_think_tokens,
@@ -3137,6 +3204,10 @@ def train_grpo(
                 think_close_bias_value=args.think_close_bias_value,
                 think_close_bias_decay=args.think_close_bias_decay,
                 force_close_after=args.force_close_after,
+                kv_bits=args.kv_bits,
+                kv_group_size=args.kv_group_size,
+                quantized_kv_start=args.quantized_kv_start,
+                max_kv_size=args.max_kv_size,
             )
             val_time = time.perf_counter() - stop
 
@@ -3155,6 +3226,7 @@ def train_grpo(
 
             # WandB logging for validation
             if args.use_wandb and wandb_run is not None and rank == 0:
+                import wandb
                 wandb.log(
                     {
                         "val/loss": val_loss,
@@ -3175,44 +3247,38 @@ def train_grpo(
             it,
         )
 
-        losses += lvalue
-        n_tokens += toks
+        losses += float(lvalue)
+        n_tokens += int(toks)
         steps += 1
 
         # Accumulate metrics
         for k, v in metrics.items():
-            accumulated_metrics[k] += v
+            if k in accumulated_metrics:
+                accumulated_metrics[k] += float(v) if hasattr(v, 'item') else float(v)
 
         # Track KL spikes
         if kl_spike_tracker is not None:
-            kl_spike_tracker.update(
-                it, float(metrics["kl"]), float(metrics["total_rewards_mean"])
-            )
+            kl_val = float(metrics["kl"]) if hasattr(metrics["kl"], 'item') else metrics["kl"]
+            reward_val = float(metrics["total_rewards_mean"]) if hasattr(metrics["total_rewards_mean"], 'item') else metrics["total_rewards_mean"]
+            kl_spike_tracker.update(it, kl_val, reward_val)
 
-        mx.eval(state, losses, n_tokens, grad_accum)
+        mx.eval(state, mx.array(losses), mx.array(n_tokens), grad_accum)
 
-        # Reporting with EXCEPTIONAL logging format
+        # Reporting
         if it % args.steps_per_report == 0 or it == args.iters:
             stop = time.perf_counter()
 
-            train_loss = mx.distributed.all_sum(losses).item() / (steps * world_size)
+            train_loss = losses / (steps * world_size)
             avg_metrics = {
                 k: v / (steps * world_size) for k, v in accumulated_metrics.items()
             }
-            n_tokens_total = mx.distributed.all_sum(n_tokens).item()
-            learning_rate = optimizer.learning_rate.item()
+            learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else optimizer.learning_rate
             it_sec = args.steps_per_report / (stop - start)
-            tokens_sec = float(n_tokens_total) / (stop - start)
-            trained_tokens += n_tokens_total
+            tokens_sec = float(n_tokens) / (stop - start)
+            trained_tokens += n_tokens
             peak_mem = mx.get_peak_memory() / 1e9
 
             if rank == 0:
-                # Convert metrics to floats
-                avg_metrics = {
-                    k: float(v.item()) if isinstance(v, mx.array) else float(v)
-                    for k, v in avg_metrics.items()
-                }
-
                 pbar.set_postfix(
                     {
                         "loss": f"{train_loss:.3f}",
@@ -3239,7 +3305,7 @@ def train_grpo(
                             f"cov={avg_metrics[cov_key]:.2%}\n"
                         )
 
-                # EXCEPTIONAL LOGGING FORMAT (from original - best-in-class!)
+                # EXCEPTIONAL LOGGING FORMAT
                 tqdm.write(
                     f"\n{'='*80}\n"
                     f"Iter {it} (Update {update_counter}):\n"
@@ -3317,29 +3383,24 @@ def train_grpo(
                 and rank == 0
                 and it % args.wandb_log_frequency == 0
             ):
+                import wandb
                 wandb_metrics = {
-                    # Core metrics
                     "train/loss": train_loss,
                     "train/perplexity": np.exp(train_loss),
                     "train/learning_rate": learning_rate,
                     "train/update": update_counter,
-                    # Performance metrics
                     "performance/iterations_per_second": it_sec,
                     "performance/tokens_per_second": tokens_sec,
                     "performance/peak_memory_gb": peak_mem,
-                    # Reward metrics
                     "rewards/mean": avg_metrics["total_rewards_mean"],
                     "rewards/std": avg_metrics["total_rewards_std"],
                     "rewards/group_mean": avg_metrics["grouped_rewards_mean"],
                     "rewards/group_std": avg_metrics["grouped_rewards_std"],
-                    # KL divergence
                     "kl/divergence": avg_metrics["kl"],
-                    # Generation stats
                     "generation/avg_tokens": avg_metrics["average_generated_tokens"],
                     "generation/min_tokens": avg_metrics["min_generated_tokens"],
                     "generation/max_tokens": avg_metrics["max_generated_tokens"],
                     "generation/hit_max_ratio": avg_metrics["hit_max_tokens_ratio"],
-                    # Clipping stats
                     "clipping/low": avg_metrics["clip_ratio_low"],
                     "clipping/high": avg_metrics["clip_ratio_high"],
                     "clipping/total": avg_metrics["clip_ratio_total"],
@@ -3355,13 +3416,9 @@ def train_grpo(
                     cov_key = f"{reward_func.__name__}_coverage"
 
                     if mean_key in avg_metrics:
-                        wandb_metrics[f"rewards/{func_name}/mean"] = avg_metrics[
-                            mean_key
-                        ]
+                        wandb_metrics[f"rewards/{func_name}/mean"] = avg_metrics[mean_key]
                         wandb_metrics[f"rewards/{func_name}/std"] = avg_metrics[std_key]
-                        wandb_metrics[f"rewards/{func_name}/coverage"] = avg_metrics[
-                            cov_key
-                        ]
+                        wandb_metrics[f"rewards/{func_name}/coverage"] = avg_metrics[cov_key]
 
                 # Add diversity metrics
                 if diversity_tracker is not None:
@@ -3370,9 +3427,7 @@ def train_grpo(
                         wandb_metrics["diversity/ratio"] = div_metrics["diversity"]
                         wandb_metrics["diversity/unique"] = div_metrics["unique"]
                         wandb_metrics["diversity/total"] = div_metrics["total"]
-                        wandb_metrics["diversity/contamination"] = div_metrics[
-                            "contamination_rate"
-                        ]
+                        wandb_metrics["diversity/contamination"] = div_metrics["contamination_rate"]
 
                 # Add KL spike metrics
                 if (
@@ -3384,14 +3439,13 @@ def train_grpo(
                     wandb_metrics["kl/spikes_avg"] = spike_summary["avg_spike_kl"]
                     wandb_metrics["kl/spikes_max"] = spike_summary["max_spike_kl"]
 
-                # Log to WandB
                 wandb.log(wandb_metrics, step=it)
 
             # Reset accumulators
-            losses = 0
+            losses = 0.0
             n_tokens = 0
             steps = 0
-            accumulated_metrics = {k: 0 for k in accumulated_metrics}
+            accumulated_metrics = {k: 0.0 for k in accumulated_metrics}
             start = time.perf_counter()
 
         # Save checkpoints
@@ -3417,7 +3471,7 @@ def train_grpo(
     if rank == 0:
         stats_summary = stats_tracker.get_summary()
         tqdm.write("\n" + "=" * 80)
-        tqdm.write("TRAINING COMPLETE - ALL FEATURES ENABLED")
+        tqdm.write("TRAINING COMPLETE")
         tqdm.write("=" * 80)
         tqdm.write(f"Total iterations: {args.iters}")
         tqdm.write(f"Total generations: {stats_summary['total_generations']}")
@@ -3434,16 +3488,13 @@ def train_grpo(
 
         # Final WandB summary
         if args.use_wandb and wandb_run is not None:
+            import wandb
             wandb.log(
                 {
                     "final/total_iterations": args.iters,
                     "final/total_generations": stats_summary["total_generations"],
-                    "final/format_compliance": stats_summary["format_compliance"][
-                        "compliance_rate"
-                    ],
-                    "final/avg_generation_length": stats_summary[
-                        "avg_generation_length"
-                    ],
+                    "final/format_compliance": stats_summary["format_compliance"]["compliance_rate"],
+                    "final/avg_generation_length": stats_summary["avg_generation_length"],
                 }
             )
             wandb.finish()
