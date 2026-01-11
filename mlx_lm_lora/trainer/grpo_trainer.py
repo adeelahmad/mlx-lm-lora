@@ -1,5 +1,4 @@
 """
-Path: mlx_lm_lora/trainer/grpo_trainer.py
 GRPO Trainer - HYBRID PROFESSIONAL IMPLEMENTATION + MULTI-ACTOR
 ================================================================
 Masterfully crafted implementation combining proven architecture with advanced features.
@@ -61,7 +60,8 @@ import json
 import logging
 import threading
 import copy
-from pprint import pprint
+import signal
+import atexit
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from functools import partial
@@ -76,6 +76,12 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from mlx_lm.generate import batch_generate, generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models import cache as mlx_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+)
 from mlx_lm.tuner.callbacks import TrainingCallback
 from tqdm import tqdm
 
@@ -582,6 +588,9 @@ def generate_phased(
     fallback_max_tokens: int = 2048,
     fallback_temperature: float = 0.7,
     verbose: bool = False,
+    force_inject_think_close: bool = False,
+    think_end_token: str = "</think>",
+    answer_start_token: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Execute multi-phase generation pipeline.
@@ -596,6 +605,9 @@ def generate_phased(
         fallback_max_tokens: Max tokens for fallback single-pass generation
         fallback_temperature: Temperature for fallback generation
         verbose: Log phase details
+        force_inject_think_close: If True, inject think_end_token when thinking phase doesn't hit stop
+        think_end_token: Token to inject to close thinking phase (default: "</think>")
+        answer_start_token: Optional token to inject after think_end_token (e.g., "<answer>")
 
     Returns:
         Tuple of (full_output, phase_outputs_list)
@@ -640,18 +652,43 @@ def generate_phased(
             prompt_cache=use_cache,
         )
 
+        # Handle force injection for thinking phase
+        injected = False
+        if not hit_stop and force_inject_think_close:
+            # Check if this is a thinking-related phase
+            is_thinking_phase = (
+                phase.name.lower() in ['thinking', 'think', 'reasoning'] or
+                think_end_token in (phase.stop_sequences or [])
+            )
+
+            if is_thinking_phase:
+                # Inject the think end token
+                phase_output += think_end_token
+                injected = True
+                hit_stop = True  # Mark as hit stop since we injected it
+
+                if verbose:
+                    logger.info(f"Phase '{phase.name}': Injected {think_end_token}")
+
+                # Optionally inject answer start token
+                if answer_start_token:
+                    phase_output += answer_start_token
+                    if verbose:
+                        logger.info(f"Phase '{phase.name}': Injected {answer_start_token}")
+
         phase_info = {
             "phase": phase.name,
             "output": phase_output,
             "hit_stop": hit_stop,
             "tokens": tokens,
             "stop_sequences": phase.stop_sequences,
+            "injected_close": injected,
         }
         phase_outputs.append(phase_info)
 
         if verbose:
             logger.info(
-                f"Phase '{phase.name}': {tokens} tokens, hit_stop={hit_stop}"
+                f"Phase '{phase.name}': {tokens} tokens, hit_stop={hit_stop}, injected={injected}"
             )
 
         full_output += phase_output
@@ -1040,10 +1077,252 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "[DEPRECATED] No longer needed - actors are fresh clones each step."}
     )
 
+    # Gradient similarity detection (memory optimization)
+    gradient_similarity_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable gradient similarity detection to skip redundant grads."}
+    )
+
+    gradient_similarity_threshold: float = field(
+        default=0.95,
+        metadata={"help": "Similarity threshold (0-1). Higher = more similar required to skip."}
+    )
+
+    gradient_similarity_metric: str = field(
+        default="cosine",
+        metadata={"help": "Similarity metric: 'cosine' or 'l2'."}
+    )
+
+    # Actor divergence modes
+    actor_divergence_mode: str = field(
+        default="none",
+        metadata={"help": "Divergence mode: 'none', 'temperature', 'noise', 'both'."}
+    )
+
+    actor_divergence_scale: float = field(
+        default=0.01,
+        metadata={"help": "Scale factor for divergence (temp multiplier or noise std)."}
+    )
+
+    # Training state save/resume
+    save_state_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to save training state for resume. If None, uses adapter dir."}
+    )
+
+    resume_state_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to resume training state from."}
+    )
+
+    save_state_frequency: int = field(
+        default=100,
+        metadata={"help": "Save training state every N iterations."}
+    )
+
+    save_best_checkpoint: bool = field(
+        default=True,
+        metadata={"help": "Save best checkpoint based on validation loss."}
+    )
+
+    # Phased generation think injection
+    force_inject_think_close: bool = field(
+        default=False,
+        metadata={"help": "Force inject </think> if thinking phase doesn't hit stop sequence."}
+    )
+
+    think_start_token: str = field(
+        default="<think>",
+        metadata={"help": "Token that starts thinking phase."}
+    )
+
+    think_end_token: str = field(
+        default="</think>",
+        metadata={"help": "Token that ends thinking phase."}
+    )
+
+    answer_start_token: Optional[str] = field(
+        default=None,
+        metadata={"help": "Token that starts answer phase (e.g., '<answer>'). If None, not injected."}
+    )
+
 
 # =============================================================================
-# UTILITY CLASSES - Professional tracking and logging
+# TRAINING STATE - For save/resume functionality
 # =============================================================================
+
+
+@dataclass
+class TrainingState:
+    """
+    Complete training state for save/resume functionality.
+
+    Saves everything needed to resume training from exact point:
+    - Iteration counters
+    - Optimizer state
+    - Best validation tracking
+    - RNG state for reproducibility
+    - Training configuration
+    """
+    iteration: int = 0
+    update_counter: int = 0
+    trained_tokens: int = 0
+    best_val_loss: float = float('inf')
+    best_val_iteration: int = 0
+    total_training_time: float = 0.0
+
+    # These are stored separately as they can be large
+    optimizer_state: Optional[Dict[str, Any]] = None
+    rng_state: Optional[Any] = None
+
+    # Training args hash for validation
+    args_hash: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for saving."""
+        return {
+            "iteration": self.iteration,
+            "update_counter": self.update_counter,
+            "trained_tokens": self.trained_tokens,
+            "best_val_loss": self.best_val_loss,
+            "best_val_iteration": self.best_val_iteration,
+            "total_training_time": self.total_training_time,
+            "args_hash": self.args_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TrainingState":
+        """Create from dictionary."""
+        return cls(
+            iteration=data.get("iteration", 0),
+            update_counter=data.get("update_counter", 0),
+            trained_tokens=data.get("trained_tokens", 0),
+            best_val_loss=data.get("best_val_loss", float('inf')),
+            best_val_iteration=data.get("best_val_iteration", 0),
+            total_training_time=data.get("total_training_time", 0.0),
+            args_hash=data.get("args_hash"),
+        )
+
+    def save(self, path: Path, optimizer=None, include_optimizer: bool = True):
+        """Save training state to disk."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save main state as JSON
+        state_dict = self.to_dict()
+        state_path = path.with_suffix('.json')
+        with open(state_path, 'w') as f:
+            json.dump(state_dict, f, indent=2)
+
+        # Save optimizer state separately if requested
+        if include_optimizer and optimizer is not None:
+            try:
+                opt_state = optimizer.state
+                opt_path = path.with_name(path.stem + '_optimizer.safetensors')
+                # Flatten optimizer state for saving
+                flat_state = dict(tree_flatten(opt_state))
+                mx.save_safetensors(str(opt_path), flat_state)
+            except Exception as e:
+                logger.warning(f"Could not save optimizer state: {e}")
+
+        return state_path
+
+    @classmethod
+    def load(cls, path: Path) -> Tuple["TrainingState", Optional[Dict]]:
+        """Load training state from disk."""
+        path = Path(path)
+        state_path = path.with_suffix('.json')
+
+        if not state_path.exists():
+            raise FileNotFoundError(f"Training state not found: {state_path}")
+
+        with open(state_path, 'r') as f:
+            state_dict = json.load(f)
+
+        state = cls.from_dict(state_dict)
+
+        # Try to load optimizer state
+        opt_state = None
+        opt_path = path.with_name(path.stem + '_optimizer.safetensors')
+        if opt_path.exists():
+            try:
+                flat_state = mx.load(str(opt_path))
+                opt_state = tree_unflatten(list(flat_state.items()))
+            except Exception as e:
+                logger.warning(f"Could not load optimizer state: {e}")
+
+        return state, opt_state
+
+
+def save_training_config(args, path: Path):
+    """Save training configuration for reproducibility."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    config = {}
+    for field_name in dir(args):
+        if not field_name.startswith('_'):
+            value = getattr(args, field_name)
+            if isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                config[field_name] = value
+
+    config_path = path.with_name(path.stem + '_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2, default=str)
+
+    return config_path
+
+
+def compute_args_hash(args) -> str:
+    """Compute hash of training args for validation."""
+    key_fields = ['model', 'learning_rate', 'batch_size', 'group_size', 'beta', 'epsilon']
+    values = []
+    for field_name in key_fields:
+        if hasattr(args, field_name):
+            values.append(str(getattr(args, field_name)))
+    return hashlib.md5('|'.join(values).encode()).hexdigest()[:8]
+
+
+def sanitize_for_json(obj: Any) -> Any:
+    """
+    Recursively convert mx.array and other non-JSON-serializable types to Python primitives.
+
+    This is critical for WandB logging and JSON serialization.
+    """
+    if obj is None:
+        return None
+    elif isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    elif isinstance(obj, (int, np.integer)):
+        return int(obj)
+    elif isinstance(obj, (float, np.floating)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None  # JSON doesn't support nan/inf
+        return float(obj)
+    elif isinstance(obj, str):
+        return obj
+    elif isinstance(obj, np.ndarray):
+        # numpy array
+        return obj.tolist()
+    elif hasattr(obj, 'item'):
+        # mx.array scalar or numpy scalar
+        val = obj.item()
+        if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+            return None
+        return val
+    elif hasattr(obj, 'tolist'):
+        # mx.array or other array-like
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    else:
+        # Last resort: try to convert to string
+        try:
+            return str(obj)
+        except Exception:
+            return None
 
 
 class JSONLLogger:
@@ -1093,7 +1372,9 @@ class JSONLLogger:
         """Queue data for async writing."""
         if self.enabled and not self._shutdown:
             with self._lock:
-                self.queue.put(data)
+                # Sanitize data for JSON serialization
+                sanitized_data = sanitize_for_json(data)
+                self.queue.put(sanitized_data)
 
     def close(self):
         """Close logger gracefully."""
@@ -1346,16 +1627,25 @@ class MultiActorGRPO:
     TRUE Memory-Efficient Sequential Processing:
         For each actor:
             1. Load actor (clone from main)
-            2. Generate rollouts
-            3. Compute rewards/advantages
-            4. Compute gradients on actor
-            5. Accumulate gradients
-            6. Unload actor (free memory)
+            2. Apply divergence (temperature/noise)
+            3. Apply grad checkpointing
+            4. Generate rollouts
+            5. Compute rewards/advantages
+            6. Compute gradients on actor
+            7. Check gradient similarity (skip if too similar)
+            8. Accumulate gradients
+            9. Unload actor (free memory)
         Finally:
-            7. Average accumulated gradients
-            8. Apply to main model
+            10. Average accumulated gradients
+            11. Apply to main model
 
     Only ONE actor is ever in memory at a time.
+
+    Features:
+    - Gradient similarity detection (cosine/L2) to skip redundant grads
+    - Actor divergence modes (temperature, noise, both)
+    - Grad checkpointing propagation to actors
+    - DoRA/LoRA layer verification
     """
 
     def __init__(
@@ -1369,6 +1659,16 @@ class MultiActorGRPO:
         kl_to_main_weight: float = 0.1,
         sync_frequency: int = 10,
         verbose: bool = True,
+        # Gradient similarity
+        gradient_similarity_enabled: bool = False,
+        gradient_similarity_threshold: float = 0.95,
+        gradient_similarity_metric: str = "cosine",
+        # Actor divergence
+        divergence_mode: str = "none",
+        divergence_scale: float = 0.01,
+        # Grad checkpointing
+        grad_checkpoint_layers: Optional[List[int]] = None,
+        grad_checkpoint_frequency: int = 1,
     ):
         self.main_actor = main_actor
         self.model_path = model_path
@@ -1379,9 +1679,26 @@ class MultiActorGRPO:
         self.sync_frequency = sync_frequency
         self.verbose = verbose
 
+        # Gradient similarity settings
+        self.gradient_similarity_enabled = gradient_similarity_enabled
+        self.gradient_similarity_threshold = gradient_similarity_threshold
+        self.gradient_similarity_metric = gradient_similarity_metric
+
+        # Actor divergence settings
+        self.divergence_mode = divergence_mode
+        self.divergence_scale = divergence_scale
+
+        # Grad checkpointing settings
+        self.grad_checkpoint_layers = grad_checkpoint_layers
+        self.grad_checkpoint_frequency = grad_checkpoint_frequency
+
         valid_modes = ["main_to_actors", "actors_to_main", "bidirectional"]
         if sync_mode not in valid_modes:
             raise ValueError(f"sync_mode must be one of {valid_modes}, got {sync_mode}")
+
+        valid_divergence = ["none", "temperature", "noise", "both"]
+        if divergence_mode not in valid_divergence:
+            raise ValueError(f"divergence_mode must be one of {valid_divergence}, got {divergence_mode}")
 
         self.actor_configs = actor_configs
 
@@ -1396,6 +1713,8 @@ class MultiActorGRPO:
                 "last_rewards": [],
                 "quantization": config.quantization or "full",
                 "temperature_offset": config.temperature_offset,
+                "grads_skipped": 0,
+                "grads_accumulated": 0,
             }
             for config in actor_configs
         }
@@ -1407,6 +1726,10 @@ class MultiActorGRPO:
         # Accumulated gradients (stored between actor iterations)
         self._accumulated_grads: Optional[Dict[str, mx.array]] = None
         self._grad_count: int = 0
+        self._skipped_grads: int = 0
+
+        # For gradient similarity: store mean gradient direction
+        self._mean_grad_direction: Optional[Dict[str, mx.array]] = None
 
         # Accumulated metrics for logging
         self._accumulated_completions: List[str] = []
@@ -1416,25 +1739,94 @@ class MultiActorGRPO:
         self.total_sync_count = 0
         self.step_count = 0
 
+        # Verify DoRA/LoRA structure on main actor
+        self._lora_layers = 0
+        self._dora_layers = 0
+        self._verify_adapter_structure(main_actor)
+
         if verbose:
             tqdm.write(f"[MultiActor] Initialized: {len(actor_configs)} actors, memory_efficient=True")
+            if self._lora_layers > 0:
+                tqdm.write(f"  • LoRA layers: {self._lora_layers}")
+            if self._dora_layers > 0:
+                tqdm.write(f"  • DoRA layers: {self._dora_layers}")
+            if gradient_similarity_enabled:
+                tqdm.write(f"  • Gradient similarity: {gradient_similarity_metric}, threshold={gradient_similarity_threshold}")
+            if divergence_mode != "none":
+                tqdm.write(f"  • Divergence: {divergence_mode}, scale={divergence_scale}")
             for cfg in actor_configs:
                 tqdm.write(f"  • {cfg.name}: {cfg.quantization or 'full'}, temp_offset={cfg.temperature_offset:+.2f}")
 
-    def _load_actor(self, config: ActorConfig) -> nn.Module:
+    def _verify_adapter_structure(self, model: nn.Module):
+        """Verify LoRA/DoRA structure is present."""
+        for name, module in model.named_modules():
+            # Check for LoRA layers (have lora_a, lora_b attributes)
+            if hasattr(module, 'lora_a') and hasattr(module, 'lora_b'):
+                self._lora_layers += 1
+            # Check for DoRA layers (have magnitude attribute)
+            if hasattr(module, 'magnitude'):
+                self._dora_layers += 1
+
+    def _load_actor(self, config: ActorConfig, actor_idx: int = 0) -> nn.Module:
         """Load a single actor (clone from main with current weights)."""
         # Ensure previous actor is unloaded
         self._unload_current_actor()
 
         actor = copy.deepcopy(self.main_actor)
         actor.train()
+
+        # Apply divergence if configured
+        if self.divergence_mode in ["noise", "both"]:
+            self._apply_weight_noise(actor, actor_idx)
+
+        # Apply grad checkpointing
+        if self.grad_checkpoint_layers is not None or self.grad_checkpoint_frequency > 1:
+            self._apply_grad_checkpointing(actor)
+
         self._current_actor = actor
         self._current_config = config
 
         if self.verbose:
-            tqdm.write(f"    [MultiActor] Loaded: {config.name}")
+            extra = ""
+            if self.divergence_mode != "none":
+                extra = f" (divergence: {self.divergence_mode})"
+            tqdm.write(f"    [MultiActor] Loaded: {config.name}{extra}")
 
         return actor
+
+    def _apply_weight_noise(self, actor: nn.Module, actor_idx: int):
+        """Apply small gaussian noise to trainable weights for divergence."""
+        scale = self.divergence_scale * (actor_idx + 1)  # Progressive divergence
+
+        trainable_params = dict(tree_flatten(actor.trainable_parameters()))
+        noised_params = {}
+
+        for name, param in trainable_params.items():
+            std = float(mx.std(param)) + 1e-8
+            noise = mx.random.normal(shape=param.shape) * std * scale
+            noised_params[name] = param + noise
+
+        actor.update(tree_unflatten(list(noised_params.items())))
+        mx.eval(actor.parameters())
+
+    def _apply_grad_checkpointing(self, actor: nn.Module):
+        """Apply gradient checkpointing to actor."""
+        if not hasattr(actor, 'layers'):
+            return
+
+        layers = actor.layers
+        checkpointed = 0
+
+        if self.grad_checkpoint_layers is not None:
+            for idx in self.grad_checkpoint_layers:
+                if 0 <= idx < len(layers):
+                    grad_checkpoint(layers[idx])
+                    checkpointed += 1
+        else:
+            for idx, layer in enumerate(layers):
+                if idx % self.grad_checkpoint_frequency == 0:
+                    grad_checkpoint(layer)
+                    checkpointed += 1
 
     def _unload_current_actor(self):
         """Unload current actor to free memory."""
@@ -1447,6 +1839,16 @@ class MultiActorGRPO:
             mx.clear_cache()
             if self.verbose:
                 tqdm.write(f"    [MultiActor] Unloaded: {name}")
+
+    def get_actor_temperature(self, config: ActorConfig, base_temp: float, actor_idx: int) -> float:
+        """Get temperature for actor, including divergence scaling."""
+        temp = base_temp + config.temperature_offset
+
+        if self.divergence_mode in ["temperature", "both"]:
+            # Progressive temperature increase
+            temp *= (1.0 + self.divergence_scale * actor_idx)
+
+        return temp
 
     @property
     def num_actors(self) -> int:
@@ -1462,12 +1864,89 @@ class MultiActorGRPO:
         """Reset gradient and metrics accumulation for new step."""
         self._accumulated_grads = None
         self._grad_count = 0
+        self._skipped_grads = 0
+        self._mean_grad_direction = None
         self._accumulated_completions = []
         self._accumulated_metadata = []
         self._accumulated_rewards = []
 
-    def accumulate_gradients(self, grads: Dict[str, mx.array]):
-        """Accumulate gradients from an actor."""
+    def _compute_gradient_similarity(
+        self,
+        new_grads: Dict[str, mx.array]
+    ) -> Tuple[float, str]:
+        """
+        Compute similarity between new gradients and accumulated mean.
+
+        Returns:
+            (similarity_score, metric_used)
+        """
+        if self._mean_grad_direction is None:
+            return 0.0, self.gradient_similarity_metric
+
+        # Flatten gradients to single vectors
+        new_flat = mx.concatenate([g.flatten() for g in new_grads.values()])
+        mean_flat = mx.concatenate([g.flatten() for g in self._mean_grad_direction.values()])
+
+        if self.gradient_similarity_metric == "cosine":
+            # Cosine similarity
+            dot = mx.sum(new_flat * mean_flat)
+            norm_new = mx.sqrt(mx.sum(new_flat * new_flat)) + 1e-8
+            norm_mean = mx.sqrt(mx.sum(mean_flat * mean_flat)) + 1e-8
+            similarity = float(dot / (norm_new * norm_mean))
+        else:  # L2 distance converted to similarity
+            # L2 distance: closer = higher similarity
+            l2_dist = mx.sqrt(mx.sum((new_flat - mean_flat) ** 2))
+            # Normalize by gradient magnitude and convert to similarity
+            max_norm = mx.maximum(
+                mx.sqrt(mx.sum(new_flat * new_flat)),
+                mx.sqrt(mx.sum(mean_flat * mean_flat))
+            ) + 1e-8
+            similarity = float(1.0 - mx.minimum(l2_dist / max_norm, mx.array(1.0)))
+
+        return similarity, self.gradient_similarity_metric
+
+    def _update_mean_gradient_direction(self, grads: Dict[str, mx.array]):
+        """Update running mean of gradient direction."""
+        if self._mean_grad_direction is None:
+            self._mean_grad_direction = {k: mx.array(v) for k, v in grads.items()}
+        else:
+            # Exponential moving average
+            alpha = 0.5
+            for k, v in grads.items():
+                if k in self._mean_grad_direction:
+                    self._mean_grad_direction[k] = (
+                        alpha * v + (1 - alpha) * self._mean_grad_direction[k]
+                    )
+
+    def accumulate_gradients(
+        self,
+        grads: Dict[str, mx.array],
+        actor_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Accumulate gradients from an actor.
+
+        Returns:
+            True if gradients were accumulated, False if skipped due to similarity
+        """
+        # Check similarity if enabled and we have previous gradients
+        if self.gradient_similarity_enabled and self._accumulated_grads is not None:
+            similarity, metric = self._compute_gradient_similarity(grads)
+
+            if similarity > self.gradient_similarity_threshold:
+                self._skipped_grads += 1
+                if actor_name and actor_name in self.actor_stats:
+                    self.actor_stats[actor_name]["grads_skipped"] += 1
+                if self.verbose:
+                    tqdm.write(
+                        f"    [MultiActor] Skipping grads ({metric} similarity: {similarity:.3f} > {self.gradient_similarity_threshold})"
+                    )
+                return False
+
+        # Update mean direction for similarity computation
+        if self.gradient_similarity_enabled:
+            self._update_mean_gradient_direction(grads)
+
         if self._accumulated_grads is None:
             # First actor - just store
             self._accumulated_grads = {k: mx.array(v) for k, v in grads.items()}
@@ -1478,14 +1957,19 @@ class MultiActorGRPO:
                     self._accumulated_grads[k] = self._accumulated_grads[k] + v
                 else:
                     self._accumulated_grads[k] = mx.array(v)
+
         self._grad_count += 1
+        if actor_name and actor_name in self.actor_stats:
+            self.actor_stats[actor_name]["grads_accumulated"] += 1
+
+        return True
 
     def get_averaged_gradients(self) -> Optional[Dict[str, mx.array]]:
         """Get averaged gradients across all actors."""
         if self._accumulated_grads is None or self._grad_count == 0:
             return None
 
-        # Average by number of actors
+        # Average by number of actually accumulated grads (not skipped)
         averaged = {
             k: v / self._grad_count
             for k, v in self._accumulated_grads.items()
@@ -1539,7 +2023,18 @@ class MultiActorGRPO:
             "multi_actor/kl_to_main_weight": self.kl_to_main_weight,
             "multi_actor/memory_efficient": True,
             "multi_actor/grad_accumulations": self._grad_count,
+            "multi_actor/grads_skipped": self._skipped_grads,
+            "multi_actor/lora_layers": self._lora_layers,
+            "multi_actor/dora_layers": self._dora_layers,
         }
+
+        if self.gradient_similarity_enabled:
+            metrics["multi_actor/gradient_similarity_threshold"] = self.gradient_similarity_threshold
+            metrics["multi_actor/gradient_similarity_metric"] = self.gradient_similarity_metric
+
+        if self.divergence_mode != "none":
+            metrics["multi_actor/divergence_mode"] = self.divergence_mode
+            metrics["multi_actor/divergence_scale"] = self.divergence_scale
 
         for actor_name, stats in self.actor_stats.items():
             prefix = f"actor/{actor_name}"
@@ -1550,6 +2045,8 @@ class MultiActorGRPO:
             metrics[f"{prefix}/mean_kl"] = stats["mean_kl"]
             metrics[f"{prefix}/quantization"] = stats["quantization"]
             metrics[f"{prefix}/temp_offset"] = stats["temperature_offset"]
+            metrics[f"{prefix}/grads_skipped"] = stats["grads_skipped"]
+            metrics[f"{prefix}/grads_accumulated"] = stats["grads_accumulated"]
 
         return metrics
 
@@ -1557,6 +2054,7 @@ class MultiActorGRPO:
         """Cleanup any loaded actor and accumulated data."""
         self._unload_current_actor()
         self._accumulated_grads = None
+        self._mean_grad_direction = None
         self._grad_count = 0
         gc.collect()
         mx.clear_cache()
@@ -1617,6 +2115,16 @@ def initialize_multi_actor(
         kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
         sync_frequency=getattr(args, 'actor_sync_frequency', 10),
         verbose=getattr(args, 'actor_verbose', True),
+        # Gradient similarity settings
+        gradient_similarity_enabled=getattr(args, 'gradient_similarity_enabled', False),
+        gradient_similarity_threshold=getattr(args, 'gradient_similarity_threshold', 0.95),
+        gradient_similarity_metric=getattr(args, 'gradient_similarity_metric', 'cosine'),
+        # Actor divergence settings
+        divergence_mode=getattr(args, 'actor_divergence_mode', 'none'),
+        divergence_scale=getattr(args, 'actor_divergence_scale', 0.01),
+        # Grad checkpointing (propagate to actors)
+        grad_checkpoint_layers=getattr(args, 'grad_checkpoint_layers', None),
+        grad_checkpoint_frequency=getattr(args, 'grad_checkpoint_frequency', 1),
     )
 
 
@@ -2015,6 +2523,10 @@ def generate_grpo(
     use_phased_generation: bool = False,
     generation_phases: Optional[List[GenerationPhase]] = None,
     phased_verbose: bool = False,
+    # Think injection (NEW)
+    force_inject_think_close: bool = False,
+    think_end_token: str = "</think>",
+    answer_start_token: Optional[str] = None,
     # BiasedSampler parameters (legacy)
     use_biased_sampler: bool = False,
     min_think_tokens: int = 50,
@@ -2081,6 +2593,9 @@ def generate_grpo(
                 diversity_tracker=diversity_tracker,
                 stats_tracker=stats_tracker,
                 update_idx=update_idx,
+                force_inject_think_close=force_inject_think_close,
+                think_end_token=think_end_token,
+                answer_start_token=answer_start_token,
             )
         elif use_biased_sampler:
             # Legacy: BiasedSampler mode
@@ -2157,6 +2672,9 @@ def _generate_with_phases(
     diversity_tracker: Optional[DiversityTracker],
     stats_tracker: Optional[StatisticsTracker],
     update_idx: int,
+    force_inject_think_close: bool = False,
+    think_end_token: str = "</think>",
+    answer_start_token: Optional[str] = None,
 ) -> Tuple[List[mx.array], List[str], List[int]]:
     """
     Phased generation implementation for thinking models.
@@ -2190,6 +2708,9 @@ def _generate_with_phases(
                     phases=phases,
                     fallback_max_tokens=max_tokens,
                     verbose=verbose,
+                    force_inject_think_close=force_inject_think_close,
+                    think_end_token=think_end_token,
+                    answer_start_token=answer_start_token,
                 )
 
                 # Convert to IDs
@@ -2323,7 +2844,7 @@ def _generate_with_batch(
 
             # Track diversity
             if diversity_tracker is not None:
-                prompt_text = tokenizer.decode(batched_prompts[idx])
+                prompt_text = tokenizer.decode(batched_prompts[idx].tolist())
                 prompt_hash = hashlib.md5(prompt_text.encode()).hexdigest()
                 diversity_tracker.add_generation(
                     update_idx, completion_text, prompt_hash
@@ -2856,7 +3377,7 @@ def grpo_loss(
         raise ValueError(f"Unknown loss type: {grpo_loss_type}")
 
     # Metrics
-    mean_kl = ((kl_div * length_mask).sum(axis=1) / mx.maximum(length_mask.sum(axis=1), 1.0)).mean()
+    mean_kl = float(((kl_div * length_mask).sum(axis=1) / mx.maximum(length_mask.sum(axis=1), 1.0)).mean())
 
     # Generation statistics
     completion_lengths = [comp.shape[0] for comp in completions]
@@ -2893,10 +3414,15 @@ def grpo_loss(
             if length_mask_sum > 0
             else 0.0
         ),
-        # Only include numeric metrics from reward_metrics (skip lists/dicts)
-        **{k: v for k, v in (reward_metrics or {}).items()
-           if isinstance(v, (int, float)) and not isinstance(v, bool)},
     }
+
+    # Add numeric metrics from reward_metrics (skip lists/dicts, convert to float)
+    if reward_metrics:
+        for k, v in reward_metrics.items():
+            if hasattr(v, 'item'):
+                metrics[k] = float(v.item())
+            elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
+                metrics[k] = float(v)
 
     # Log samples if requested
     if log_samples and jsonl_logger is not None and completion_texts is not None:
@@ -3123,6 +3649,10 @@ def evaluate_grpo(
     use_phased_generation: bool = False,
     generation_phases: Optional[List[GenerationPhase]] = None,
     phased_verbose: bool = False,
+    # Think injection
+    force_inject_think_close: bool = False,
+    think_end_token: str = "</think>",
+    answer_start_token: Optional[str] = None,
     # BiasedSampler parameters
     use_biased_sampler: bool = False,
     min_think_tokens: int = 50,
@@ -3186,6 +3716,9 @@ def evaluate_grpo(
             use_phased_generation=use_phased_generation,
             generation_phases=generation_phases,
             phased_verbose=phased_verbose,
+            force_inject_think_close=force_inject_think_close,
+            think_end_token=think_end_token,
+            answer_start_token=answer_start_token,
             use_biased_sampler=use_biased_sampler,
             min_think_tokens=min_think_tokens,
             max_think_tokens=max_think_tokens,
@@ -3270,13 +3803,19 @@ def evaluate_grpo(
             all_metrics = {}
             for k, v in metrics.items():
                 # Skip non-numeric metrics (lists, dicts, etc.)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                # Handle mx.array, numpy, and Python numeric types
+                if hasattr(v, 'item'):
+                    all_metrics[k] = float(v.item()) * float(toks)
+                elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
                     all_metrics[k] = float(v) * float(toks)
         else:
             for k, v in metrics.items():
-                # Skip non-numeric metrics
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and k in all_metrics:
-                    all_metrics[k] += float(v) * float(toks)
+                if k in all_metrics:
+                    # Handle mx.array, numpy, and Python numeric types
+                    if hasattr(v, 'item'):
+                        all_metrics[k] += float(v.item()) * float(toks)
+                    elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
+                        all_metrics[k] += float(v) * float(toks)
 
     # Distributed reduction
     all_losses_arr = mx.array(all_losses)
@@ -3286,15 +3825,22 @@ def evaluate_grpo(
     all_losses_sum = mx.distributed.all_sum(all_losses_arr, stream=mx.cpu)
     ntokens_sum = mx.distributed.all_sum(ntokens_arr, stream=mx.cpu)
 
+    # Convert to Python floats for safe division
+    ntokens_sum_float = float(ntokens_sum.item()) if hasattr(ntokens_sum, 'item') else float(ntokens_sum)
+    all_losses_sum_float = float(all_losses_sum.item()) if hasattr(all_losses_sum, 'item') else float(all_losses_sum)
+
     if all_metrics:
-        all_metrics_sum = {k: mx.distributed.all_sum(mx.array(v)) for k, v in all_metrics.items()}
-        avg_metrics = {k: float(v) / float(ntokens_sum) for k, v in all_metrics_sum.items()}
+        all_metrics_sum = {}
+        for k, v in all_metrics.items():
+            reduced = mx.distributed.all_sum(mx.array(v))
+            all_metrics_sum[k] = float(reduced.item()) if hasattr(reduced, 'item') else float(reduced)
+        avg_metrics = {k: v / ntokens_sum_float for k, v in all_metrics_sum.items()}
     else:
         avg_metrics = {}
 
-    avg_loss = float(all_losses_sum) / float(ntokens_sum)
+    avg_loss = all_losses_sum_float / ntokens_sum_float
 
-    return avg_loss, int(ntokens_sum), avg_metrics
+    return avg_loss, int(ntokens_sum_float), avg_metrics
 
 
 def train_grpo(
@@ -3377,12 +3923,12 @@ def train_grpo(
         tqdm.write(f"✓ Sample Logging: {'ENABLED' if args.log_samples else 'DISABLED'}")
         tqdm.write(f"✓ WandB Logging: {'ENABLED' if args.use_wandb else 'DISABLED'}")
         if args.use_phased_generation:
-            tqdm.write("✓ Phased Generation: ENABLED")
+            tqdm.write(f"✓ Phased Generation: ENABLED")
             if generation_phases:
                 for phase in generation_phases:
                     tqdm.write(f"  - {phase.name}: max={phase.max_tokens}, temp={phase.temperature}")
         elif args.use_biased_sampler:
-            tqdm.write("✓ BiasedSampler: ENABLED (legacy)")
+            tqdm.write(f"✓ BiasedSampler: ENABLED (legacy)")
             tqdm.write(f"  - Min think: {args.min_think_tokens} tokens")
             tqdm.write(f"  - Max think: {args.max_think_tokens} tokens")
             tqdm.write(f"  - Force close: {args.force_close_after} tokens")
@@ -3457,7 +4003,7 @@ def train_grpo(
             lora_params=None,
         )
         if multi_actor and rank == 0:
-            tqdm.write("✓ Multi-Actor GRPO: ENABLED")
+            tqdm.write(f"✓ Multi-Actor GRPO: ENABLED")
             tqdm.write(f"  - Actors: {multi_actor.num_actors}")
             for config in multi_actor.actor_configs:
                 tqdm.write(f"    • {config.name}: {config.quantization or 'full'}, temp_offset={config.temperature_offset}")
@@ -3508,15 +4054,18 @@ def train_grpo(
             all_actor_metadata = []
             all_completion_texts_for_log = []
 
+            # For combined logging: accumulate data from all actors
+            all_logging_data = []  # List of (completion_text, actor_meta, advantage, kl, total_reward, individual_rewards, batch_idx)
+
             for actor_idx, actor_group_size in enumerate(distribution):
                 if actor_group_size == 0:
                     continue
 
                 config = multi_actor.actor_configs[actor_idx]
-                actor_temp = args.temperature + config.temperature_offset
+                actor_temp = multi_actor.get_actor_temperature(config, args.temperature, actor_idx)
 
-                # 1. Load actor (clone from main)
-                actor = multi_actor._load_actor(config)
+                # 1. Load actor (clone from main with divergence)
+                actor = multi_actor._load_actor(config, actor_idx=actor_idx)
 
                 # 2. Generate from this actor
                 completions, completion_texts, batch_idx = generate_grpo(
@@ -3540,6 +4089,9 @@ def train_grpo(
                     use_phased_generation=args.use_phased_generation,
                     generation_phases=generation_phases,
                     phased_verbose=args.phased_verbose,
+                    force_inject_think_close=args.force_inject_think_close,
+                    think_end_token=args.think_end_token,
+                    answer_start_token=args.answer_start_token,
                     use_biased_sampler=args.use_biased_sampler,
                     min_think_tokens=args.min_think_tokens,
                     max_think_tokens=args.max_think_tokens,
@@ -3615,12 +4167,8 @@ def train_grpo(
                 # 5. Compute gradients on this actor
                 actor_loss_value_and_grad = nn.value_and_grad(actor, loss_fn)
 
-                should_log = (
-                    args.log_samples
-                    and jsonl_logger is not None
-                    and iteration % args.log_samples_frequency == 0
-                    and actor_idx == 0  # Only log first actor's samples in detail
-                )
+                # Disable per-actor logging - we'll do combined logging after all actors
+                should_log = False
 
                 (lvalue, toks, metrics), actor_grad = actor_loss_value_and_grad(
                     actor,
@@ -3645,9 +4193,37 @@ def train_grpo(
                     actor_metadata=ordered_actor_metadata,
                 )
 
-                # 6. Accumulate gradients
+                # Accumulate logging data for combined logging later
+                total_rewards_list = reward_metrics.get("total_rewards", []) if reward_metrics else []
+                individual_rewards_dict = reward_metrics.get("individual_rewards", {}) if reward_metrics else {}
+
+                # Convert advantages to list for safe indexing
+                advantages_list = advantages.tolist() if hasattr(advantages, 'tolist') else list(advantages)
+
+                for i, (comp_text, actor_meta, batch_i) in enumerate(zip(ordered_completion_texts, ordered_actor_metadata, ordered_batch_indices)):
+                    adv_val = float(advantages_list[i]) if i < len(advantages_list) else 0.0
+                    kl_val = float(metrics.get("kl", 0.0)) if not hasattr(metrics.get("kl", 0.0), 'item') else float(metrics.get("kl", 0.0).item())
+                    total_reward = float(total_rewards_list[i]) if i < len(total_rewards_list) and total_rewards_list[i] is not None else None
+                    ind_rewards = {}
+                    for func_name, scores in individual_rewards_dict.items():
+                        if i < len(scores) and scores[i] is not None:
+                            ind_rewards[func_name] = float(scores[i])
+                    all_logging_data.append({
+                        "completion_text": comp_text,
+                        "actor_meta": actor_meta,
+                        "advantage": adv_val,
+                        "kl": kl_val,
+                        "total_reward": total_reward,
+                        "individual_rewards": ind_rewards,
+                        "batch_idx": batch_i,
+                    })
+
+                # 6. Accumulate gradients (with similarity check)
                 actor_grad_flat = dict(tree_flatten(actor_grad))
-                multi_actor.accumulate_gradients(actor_grad_flat)
+                grad_accumulated = multi_actor.accumulate_gradients(
+                    actor_grad_flat,
+                    actor_name=config.name,
+                )
 
                 # Accumulate metrics
                 total_loss += float(lvalue)
@@ -3657,6 +4233,10 @@ def train_grpo(
                 # Update actor stats
                 total_rewards = reward_metrics.get("total_rewards", [])
                 actor_kl = metrics.get("kl", 0.0)
+                if hasattr(actor_kl, 'item'):
+                    actor_kl = float(actor_kl.item())
+                else:
+                    actor_kl = float(actor_kl)
                 multi_actor.accumulate_metrics(
                     actor_name=config.name,
                     completions=completion_texts,
@@ -3688,9 +4268,108 @@ def train_grpo(
             metrics = {}
             if all_metrics:
                 for key in all_metrics[0].keys():
-                    values = [m.get(key, 0.0) for m in all_metrics if isinstance(m.get(key, 0), (int, float))]
+                    values = []
+                    for m in all_metrics:
+                        v = m.get(key)
+                        if v is not None:
+                            if hasattr(v, 'item'):
+                                values.append(float(v.item()))
+                            elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
+                                values.append(float(v))
                     if values:
                         metrics[key] = float(np.mean(values))
+
+            # =========================================================
+            # COMBINED LOGGING: Log all actors' completions together
+            # =========================================================
+            should_log_combined = (
+                args.log_samples
+                and jsonl_logger is not None
+                and iteration % args.log_samples_frequency == 0
+            )
+
+            if should_log_combined and all_logging_data:
+                from collections import Counter
+
+                # Group by prompt index
+                unique_prompts = sorted(set(d["batch_idx"] for d in all_logging_data))
+
+                for prompt_idx in unique_prompts:
+                    prompt_entries = [d for d in all_logging_data if d["batch_idx"] == prompt_idx]
+
+                    if not prompt_entries:
+                        continue
+
+                    prompt_completions = []
+                    prompt_rewards = []
+                    prompt_advantages = []
+                    prompt_kls = []
+                    prompt_actors = []
+
+                    for entry in prompt_entries:
+                        actor_meta = entry["actor_meta"]
+                        completion_entry = {
+                            "completion": entry["completion_text"],
+                            "completion_length": len(entry["completion_text"]),
+                            "advantage": entry["advantage"],
+                            "kl": entry["kl"],
+                            "total_reward": entry["total_reward"],
+                            "individual_rewards": entry["individual_rewards"],
+                        }
+
+                        if actor_meta:
+                            completion_entry["actor"] = {
+                                "name": actor_meta.get("actor_name"),
+                                "idx": actor_meta.get("actor_idx"),
+                                "quantization": actor_meta.get("actor_quantization"),
+                                "temperature": actor_meta.get("actor_temperature"),
+                                "temp_offset": actor_meta.get("actor_temp_offset"),
+                            }
+                            prompt_actors.append(actor_meta.get("actor_name", "unknown"))
+
+                        prompt_completions.append(completion_entry)
+                        prompt_rewards.append(entry["total_reward"] if entry["total_reward"] is not None else entry["advantage"])
+                        prompt_advantages.append(entry["advantage"])
+                        prompt_kls.append(entry["kl"])
+
+                    # Compute group stats
+                    valid_rewards = [r for r in prompt_rewards if r is not None]
+                    group_stats = {
+                        "advantage_mean": float(np.mean(prompt_advantages)),
+                        "advantage_std": float(np.std(prompt_advantages)) if len(prompt_advantages) > 1 else 0.0,
+                        "kl_mean": float(np.mean(prompt_kls)),
+                        "kl_max": float(np.max(prompt_kls)),
+                        "kl_min": float(np.min(prompt_kls)),
+                        "reward_mean": float(np.mean(valid_rewards)) if valid_rewards else None,
+                        "reward_std": float(np.std(valid_rewards)) if len(valid_rewards) > 1 else 0.0,
+                        "num_actors": len(set(prompt_actors)),
+                    }
+
+                    # Add actor distribution
+                    if prompt_actors:
+                        actor_counts = Counter(prompt_actors)
+                        group_stats["actor_distribution"] = dict(actor_counts)
+
+                    # Get type info if available
+                    type_info_val = type_info[prompt_idx] if type_info and prompt_idx < len(type_info) else None
+
+                    jsonl_logger.log({
+                        "iteration": iteration,
+                        "update": update_counter,
+                        "prompt": prompt_text[prompt_idx],
+                        "expected_answer": answer_text[prompt_idx],
+                        "type": type_info_val,
+                        "group_size": len(prompt_completions),
+                        "completions": prompt_completions,
+                        "group_stats": group_stats,
+                        "hyperparameters": {
+                            "beta": args.beta,
+                            "epsilon": args.epsilon,
+                            "epsilon_high": args.epsilon_high,
+                            "grpo_loss_type": args.grpo_loss_type,
+                            "num_actors": multi_actor.num_actors,
+                        },
+                    })
 
             multi_actor.sync_to_main()
 
@@ -3719,6 +4398,9 @@ def train_grpo(
                 use_phased_generation=args.use_phased_generation,
                 generation_phases=generation_phases,
                 phased_verbose=args.phased_verbose,
+                force_inject_think_close=args.force_inject_think_close,
+                think_end_token=args.think_end_token,
+                answer_start_token=args.answer_start_token,
                 use_biased_sampler=args.use_biased_sampler,
                 min_think_tokens=args.min_think_tokens,
                 max_think_tokens=args.max_think_tokens,
@@ -3866,7 +4548,117 @@ def train_grpo(
     start = time.perf_counter()
     pbar = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
 
+    # Track last validation loss for best checkpoint comparison
+    last_val_loss = float('inf')
+
+    # =========================================================================
+    # TRAINING STATE MANAGEMENT
+    # =========================================================================
+
+    # Initialize or load training state
+    training_state = TrainingState()
+    best_val_loss = float('inf')
+    start_iteration = 1
+
+    # Determine state save path
+    state_save_path = Path(args.save_state_path) if args.save_state_path else Path(args.adapter_file).parent / "training_state"
+
+    # Resume from saved state if provided
+    if args.resume_state_path:
+        try:
+            resumed_state, opt_state = TrainingState.load(Path(args.resume_state_path))
+            training_state = resumed_state
+            start_iteration = training_state.iteration + 1
+            best_val_loss = training_state.best_val_loss
+            trained_tokens = training_state.trained_tokens
+            update_counter = training_state.update_counter
+
+            # Restore optimizer state if available
+            if opt_state is not None:
+                try:
+                    optimizer.state = opt_state
+                    if rank == 0:
+                        tqdm.write(f"✓ Resumed optimizer state")
+                except Exception as e:
+                    if rank == 0:
+                        tqdm.write(f"⚠ Could not restore optimizer state: {e}")
+
+            if rank == 0:
+                tqdm.write(f"✓ Resumed from iteration {training_state.iteration}")
+                tqdm.write(f"  - Update counter: {update_counter}")
+                tqdm.write(f"  - Trained tokens: {trained_tokens}")
+                tqdm.write(f"  - Best val loss: {best_val_loss:.4f}")
+        except Exception as e:
+            if rank == 0:
+                tqdm.write(f"⚠ Could not load training state: {e}")
+
+    # Compute args hash for validation
+    training_state.args_hash = compute_args_hash(args)
+
+    # Save training config
+    if rank == 0:
+        try:
+            config_path = save_training_config(args, state_save_path)
+            tqdm.write(f"✓ Training config saved: {config_path}")
+        except Exception as e:
+            tqdm.write(f"⚠ Could not save training config: {e}")
+
+    # =========================================================================
+    # INTERRUPT HANDLER - Save state on Ctrl+C
+    # =========================================================================
+
+    _interrupted = False
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _interrupt_handler(signum, frame):
+        nonlocal _interrupted
+        if _interrupted:
+            # Second interrupt - force exit
+            tqdm.write("\n⚠ Force exit requested. Exiting without saving...")
+            signal.signal(signal.SIGINT, _original_sigint)
+            raise KeyboardInterrupt()
+
+        _interrupted = True
+        tqdm.write("\n" + "=" * 60)
+        tqdm.write("⚠ INTERRUPT RECEIVED - Saving checkpoint...")
+        tqdm.write("  (Press Ctrl+C again to force exit)")
+        tqdm.write("=" * 60)
+
+    signal.signal(signal.SIGINT, _interrupt_handler)
+
+    def _save_interrupted_checkpoint():
+        """Save checkpoint on interrupt."""
+        if rank != 0:
+            return
+
+        try:
+            # Save adapter weights
+            interrupted_adapter = Path(args.adapter_file).parent / "checkpoint_interrupted.safetensors"
+            adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+            mx.save_safetensors(str(interrupted_adapter), adapter_weights)
+            tqdm.write(f"✓ Saved interrupted adapter: {interrupted_adapter}")
+
+            # Save training state
+            training_state.iteration = it
+            training_state.update_counter = update_counter
+            training_state.trained_tokens = trained_tokens
+            training_state.best_val_loss = best_val_loss
+            training_state.total_training_time = time.perf_counter() - start
+
+            interrupted_state = state_save_path.parent / "checkpoint_interrupted"
+            state_path = training_state.save(interrupted_state, optimizer=optimizer)
+            tqdm.write(f"✓ Saved interrupted state: {state_path}")
+
+            tqdm.write(f"  Resume with: --resume-state-path {interrupted_state}")
+            tqdm.write(f"               --resume-adapter-file {interrupted_adapter}")
+        except Exception as e:
+            tqdm.write(f"✗ Failed to save interrupted checkpoint: {e}")
+
     for it in pbar:
+        # Skip iterations if resuming
+        if it < start_iteration:
+            continue
+
         batch = next(
             iterate_batches(
                 dataset=train_dataset,
@@ -3941,15 +4733,28 @@ def train_grpo(
             # WandB logging for validation
             if args.use_wandb and wandb_run is not None and rank == 0:
                 import wandb
-                wandb.log(
-                    {
-                        "val/loss": val_loss,
-                        "val/perplexity": np.exp(val_loss),
-                        "val/time": val_time,
-                        **{f"val/{k}": v for k, v in val_metrics.items()},
-                    },
-                    step=it,
-                )
+                val_wandb_metrics = sanitize_for_json({
+                    "val/loss": val_loss,
+                    "val/perplexity": np.exp(val_loss),
+                    "val/time": val_time,
+                    **{f"val/{k}": v for k, v in val_metrics.items()},
+                })
+                wandb.log(val_wandb_metrics, step=it)
+
+            # Track for best checkpoint
+            last_val_loss = val_loss
+
+            # Save best checkpoint on validation improvement
+            if args.save_best_checkpoint and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                training_state.best_val_loss = best_val_loss
+                training_state.best_val_iteration = it
+
+                best_adapter = Path(args.adapter_file).parent / "best_adapter.safetensors"
+                adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+                mx.save_safetensors(str(best_adapter), adapter_weights)
+                if rank == 0:
+                    tqdm.write(f"Iter {it}: New best val loss {val_loss:.4f} → saved to {best_adapter}")
 
             start = time.perf_counter()
 
@@ -3967,16 +4772,30 @@ def train_grpo(
 
         # Accumulate metrics (skip non-numeric values like lists/dicts)
         for k, v in metrics.items():
-            if k in accumulated_metrics and isinstance(v, (int, float)) and not isinstance(v, bool):
-                accumulated_metrics[k] += float(v) if hasattr(v, 'item') else float(v)
+            if k in accumulated_metrics:
+                # Handle mx.array, numpy, and Python numeric types
+                if hasattr(v, 'item'):
+                    accumulated_metrics[k] += float(v.item())
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    accumulated_metrics[k] += float(v)
+                elif isinstance(v, np.floating):
+                    accumulated_metrics[k] += float(v)
 
         # Track KL spikes
-        if kl_spike_tracker is not None and "kl" in metrics.keys():
-            kl_val = float(metrics["kl"]) if hasattr(metrics["kl"], 'item') else metrics["kl"]
-            reward_val = float(metrics["total_rewards_mean"]) if hasattr(metrics["total_rewards_mean"], 'item') else metrics["total_rewards_mean"]
+        if kl_spike_tracker is not None:
+            kl_val = metrics.get("kl", 0.0)
+            if hasattr(kl_val, 'item'):
+                kl_val = float(kl_val.item())
+            else:
+                kl_val = float(kl_val)
+
+            reward_val = metrics.get("total_rewards_mean", 0.0)
+            if hasattr(reward_val, 'item'):
+                reward_val = float(reward_val.item())
+            else:
+                reward_val = float(reward_val)
+
             kl_spike_tracker.update(it, kl_val, reward_val)
-        else:
-            pprint.print(metrics)
 
         mx.eval(state, mx.array(losses), mx.array(n_tokens), grad_accum)
 
@@ -3992,7 +4811,8 @@ def train_grpo(
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
-            peak_mem = mx.get_peak_memory() / 1e9
+            peak_mem_val = mx.get_peak_memory()
+            peak_mem = float(peak_mem_val.item() if hasattr(peak_mem_val, 'item') else peak_mem_val) / 1e9
 
             if rank == 0:
                 pbar.set_postfix(
@@ -4159,6 +4979,8 @@ def train_grpo(
                 if multi_actor:
                     wandb_metrics.update(multi_actor.get_wandb_metrics())
 
+                # Sanitize all metrics for JSON serialization
+                wandb_metrics = sanitize_for_json(wandb_metrics)
                 wandb.log(wandb_metrics, step=it)
 
             # Reset accumulators
@@ -4178,10 +5000,43 @@ def train_grpo(
             mx.save_safetensors(str(checkpoint), adapter_weights)
             tqdm.write(f"Iter {it}: Saved to {args.adapter_file} and {checkpoint}")
 
+        # Periodic state saving
+        if it % args.save_state_frequency == 0 and rank == 0:
+            training_state.iteration = it
+            training_state.update_counter = update_counter
+            training_state.trained_tokens = trained_tokens
+            training_state.total_training_time = time.perf_counter() - start
+
+            try:
+                state_path = training_state.save(state_save_path, optimizer=optimizer)
+                tqdm.write(f"Iter {it}: Saved training state to {state_path}")
+            except Exception as e:
+                tqdm.write(f"⚠ Could not save training state: {e}")
+
+        # Check for interrupt
+        if _interrupted:
+            _save_interrupted_checkpoint()
+            break
+
+    # Restore original signal handler
+    signal.signal(signal.SIGINT, _original_sigint)
+
     # Final save
     adapter_weights = dict(tree_flatten(model.trainable_parameters()))
     mx.save_safetensors(str(args.adapter_file), adapter_weights)
     tqdm.write(f"Saved final weights to {args.adapter_file}.")
+
+    # Save final training state
+    if rank == 0:
+        training_state.iteration = args.iters
+        training_state.update_counter = update_counter
+        training_state.trained_tokens = trained_tokens
+        training_state.total_training_time = time.perf_counter() - start
+        try:
+            final_state_path = training_state.save(state_save_path, optimizer=optimizer)
+            tqdm.write(f"Saved final training state to {final_state_path}")
+        except Exception as e:
+            tqdm.write(f"⚠ Could not save final training state: {e}")
 
     # Close logger
     if jsonl_logger:
@@ -4215,13 +5070,12 @@ def train_grpo(
         # Final WandB summary
         if args.use_wandb and wandb_run is not None:
             import wandb
-            wandb.log(
-                {
-                    "final/total_iterations": args.iters,
-                    "final/total_generations": stats_summary["total_generations"],
-                    "final/format_compliance": stats_summary["format_compliance"]["compliance_rate"],
-                    "final/avg_generation_length": stats_summary["avg_generation_length"],
-                }
-            )
+            final_metrics = sanitize_for_json({
+                "final/total_iterations": args.iters,
+                "final/total_generations": stats_summary["total_generations"],
+                "final/format_compliance": stats_summary["format_compliance"]["compliance_rate"],
+                "final/avg_generation_length": stats_summary["avg_generation_length"],
+            })
+            wandb.log(final_metrics)
             wandb.finish()
             tqdm.write("✓ WandB run finished")

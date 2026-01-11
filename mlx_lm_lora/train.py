@@ -1,5 +1,4 @@
 """
-Path: mlx_lm_lora/train.py
 MLX-LM Training Script
 ======================
 Unified training script supporting multiple training modes:
@@ -205,7 +204,7 @@ CONFIG_DEFAULTS = {
     "actor_quantizations": None,
     "actor_kl_to_main_weight": 0.1,
     "actor_sync_mode": "main_to_actors",
-    "actor_sync_frequency": 10,
+    "actor_sync_frequency": 2,
     "lazy_load_actors": False,
     "actor_temperature_offsets": None,
     "actor_verbose": True,
@@ -407,25 +406,25 @@ def build_parser():
         "--lora-rank",
         type=int,
         help="LoRA rank parameter.",
-        default=32,
+        default=64,
     )
     parser.add_argument(
         "--lora-alpha",
         type=int,
         help="LoRA alpha parameter (typically 2x rank).",
-        default=64,
+        default=128,
     )
     parser.add_argument(
         "--lora-dropout",
         type=float,
         help="LoRA dropout (0.0 enables fast kernels).",
-        default=0.01,
+        default=0.05,
     )
     parser.add_argument(
         "--lora-scale",
         type=float,
         help="LoRA scale (alpha / rank).",
-        default=0,
+        default=2,
     )
 
     # ORPO args
@@ -497,7 +496,7 @@ def build_parser():
         "--temperature",
         type=float,
         help="Temperature for sampling.",
-        default=1.0,
+        default=0.8,
     )
     parser.add_argument(
         "--reward-weights",
@@ -558,7 +557,7 @@ def build_parser():
         "--phased-thinking-max-tokens",
         type=int,
         help="Max tokens for thinking phase.",
-        default=90,
+        default=192,
     )
     parser.add_argument(
         "--phased-answer-max-tokens",
@@ -630,7 +629,7 @@ def build_parser():
     parser.add_argument(
         "--actor-sync-frequency",
         type=int,
-        default=3,
+        default=8,
         help="Sync weights every N training steps.",
     )
     parser.add_argument(
@@ -643,6 +642,99 @@ def build_parser():
         type=str,
         default=None,
         help="Comma-separated temperature offsets per actor: '-0.1,0.0,0.1'.",
+    )
+
+    # Gradient similarity (memory optimization)
+    parser.add_argument(
+        "--gradient-similarity-enabled",
+        action="store_true",
+        help="Enable gradient similarity detection to skip redundant grads.",
+    )
+    parser.add_argument(
+        "--gradient-similarity-threshold",
+        type=float,
+        default=0.95,
+        help="Similarity threshold (0-1). Higher = more similar required to skip.",
+    )
+    parser.add_argument(
+        "--gradient-similarity-metric",
+        type=str,
+        choices=["cosine", "l2"],
+        default="cosine",
+        help="Similarity metric: 'cosine' or 'l2'.",
+    )
+
+    # Actor divergence modes
+    parser.add_argument(
+        "--actor-divergence-mode",
+        type=str,
+        choices=["none", "temperature", "noise", "both"],
+        default="both",
+        help="Divergence mode: 'none', 'temperature', 'noise', 'both'.",
+    )
+    parser.add_argument(
+        "--actor-divergence-scale",
+        type=float,
+        default=0.01,
+        help="Scale factor for divergence (temp multiplier or noise std).",
+    )
+
+    # Training state save/resume
+    parser.add_argument(
+        "--save-state-path",
+        type=str,
+        default=None,
+        help="Path to save training state for resume. If None, uses adapter dir.",
+    )
+    parser.add_argument(
+        "--resume-state-path",
+        type=str,
+        default=None,
+        help="Path to resume training state from.",
+    )
+    parser.add_argument(
+        "--save-state-frequency",
+        type=int,
+        default=20,
+        help="Save training state every N iterations.",
+    )
+    parser.add_argument(
+        "--save-best-checkpoint",
+        action="store_true",
+        default=False,
+        help="Save best checkpoint based on validation loss.",
+    )
+    parser.add_argument(
+        "--no-save-best-checkpoint",
+        action="store_false",
+        dest="save_best_checkpoint",
+        help="Disable saving best checkpoint.",
+    )
+
+    # Phased generation think injection
+    parser.add_argument(
+        "--force-inject-think-close",
+        action="store_true",
+        default=True,
+        help="Force inject </think> if thinking phase doesn't hit stop sequence.",
+    )
+    parser.add_argument(
+        "--think-start-token",
+        type=str,
+        default="<think>",
+        help="Token that starts thinking phase.",
+    )
+    parser.add_argument(
+        "--think-end-token",
+        type=str,
+        default="</think>",
+        help="Token that ends thinking phase.",
+    )
+    parser.add_argument(
+        "--answer-start-token",
+        type=str,
+        default=None,
+        help="Token that starts answer phase (e.g., '<answer>'). If None, not injected.",
     )
 
     return parser
@@ -1035,21 +1127,21 @@ def train_model(
             # Phased generation
             use_phased_generation=getattr(args, 'use_phased_generation', False),
             generation_phases=getattr(args, 'generation_phases', None),
-            phased_thinking_max_tokens=getattr(args, 'phased_thinking_max_tokens', 90),
-            phased_answer_max_tokens=getattr(args, 'phased_answer_max_tokens', 128),
-            phased_min_thinking_tokens=getattr(args, 'phased_min_thinking_tokens', 20),
-            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.8),
-            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.3),
-            phased_verbose=getattr(args, 'phased_verbose', True),
+            phased_thinking_max_tokens=getattr(args, 'phased_thinking_max_tokens', 1500),
+            phased_answer_max_tokens=getattr(args, 'phased_answer_max_tokens', 500),
+            phased_min_thinking_tokens=getattr(args, 'phased_min_thinking_tokens', 50),
+            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.7),
+            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.5),
+            phased_verbose=getattr(args, 'phased_verbose', False),
             # BiasedSampler (legacy)
-            use_biased_sampler=getattr(args, 'use_biased_sampler', True),
+            use_biased_sampler=getattr(args, 'use_biased_sampler', False),
             min_think_tokens=getattr(args, 'min_think_tokens', 50),
             max_think_tokens=getattr(args, 'max_think_tokens', 120),
             think_close_bias_start=getattr(args, 'think_close_bias_start', 5),
             think_close_bias_value=getattr(args, 'think_close_bias_value', 26.0),
             think_close_bias_decay=getattr(args, 'think_close_bias_decay', 0.095),
             force_close_after=getattr(args, 'force_close_after', 220),
-            sampler_verbose=getattr(args, 'sampler_verbose', True),
+            sampler_verbose=getattr(args, 'sampler_verbose', False),
             # Tracking
             track_diversity=getattr(args, 'track_diversity', True),
             track_kl_spikes=getattr(args, 'track_kl_spikes', True),
@@ -1075,15 +1167,32 @@ def train_model(
             ),
             actor_kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
             actor_sync_mode=getattr(args, 'actor_sync_mode', 'main_to_actors'),
-            actor_sync_frequency=getattr(args, 'actor_sync_frequency', 3),
-            lazy_load_actors=getattr(args, 'lazy_load_actors', True),
+            actor_sync_frequency=getattr(args, 'actor_sync_frequency', 2),
+            lazy_load_actors=getattr(args, 'lazy_load_actors', False),
             actor_temperature_offsets=(
                 [float(t.strip()) for t in args.actor_temperature_offsets.split(",")]
                 if getattr(args, 'actor_temperature_offsets', None)
                 else None
             ),
             actor_verbose=getattr(args, 'actor_verbose', True),
-            actor_update_references_frequency=getattr(args, 'actor_update_references_frequency', 10),
+            actor_update_references_frequency=getattr(args, 'actor_update_references_frequency', 50),
+            # Gradient similarity
+            gradient_similarity_enabled=getattr(args, 'gradient_similarity_enabled', False),
+            gradient_similarity_threshold=getattr(args, 'gradient_similarity_threshold', 0.95),
+            gradient_similarity_metric=getattr(args, 'gradient_similarity_metric', 'cosine'),
+            # Actor divergence
+            actor_divergence_mode=getattr(args, 'actor_divergence_mode', 'none'),
+            actor_divergence_scale=getattr(args, 'actor_divergence_scale', 0.01),
+            # Training state save/resume
+            save_state_path=getattr(args, 'save_state_path', None),
+            resume_state_path=getattr(args, 'resume_state_path', None),
+            save_state_frequency=getattr(args, 'save_state_frequency', 100),
+            save_best_checkpoint=getattr(args, 'save_best_checkpoint', True),
+            # Think injection
+            force_inject_think_close=getattr(args, 'force_inject_think_close', False),
+            think_start_token=getattr(args, 'think_start_token', '<think>'),
+            think_end_token=getattr(args, 'think_end_token', '</think>'),
+            answer_start_token=getattr(args, 'answer_start_token', None),
         )
 
         print("Loading pretrained reference model")
