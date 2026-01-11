@@ -352,14 +352,14 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Upper epsilon for clipping. Defaults to epsilon if None."},
     )
     max_completion_length: int = field(
-        default=320, metadata={"help": "Maximum tokens to generate per completion."}
+        default=2048, metadata={"help": "Maximum tokens to generate per completion."}
     )
     reference_model_path: str = field(
         default=None,
         metadata={"help": "Path to reference model. If None, uses same model."},
     )
     temperature: float = field(
-        default=0.8,
+        default=0.5,
         metadata={"help": "Sampling temperature."},
     )
     grpo_loss_type: str = field(
@@ -379,11 +379,11 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Sampling parameters (CONFIGURABLE - no hardcoding!)
     top_p: float = field(
-        default=0.80,
+        default=0.7,
         metadata={"help": "Top-p (nucleus) sampling parameter."},
     )
     top_k: int = field(
-        default=20,
+        default=30,
         metadata={"help": "Top-k sampling parameter. Set to 0 to disable."},
     )
     min_p: float = field(
@@ -430,7 +430,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # KV Cache Optimization (NEW - MLX-LM advanced features)
     kv_bits: Optional[int] = field(
-        default=4,  # None = no quantization (default)
+        default=None,  # None = no quantization (default)
         metadata={
             "help": "Number of bits for KV cache quantization (4, 8). "
             "Reduces memory by 50-75%. Recommended: 8 for minimal quality loss. "
@@ -449,7 +449,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
     max_kv_size: Optional[int] = field(
-        default=2048,
+        default=None,
         metadata={
             "help": "Maximum KV cache size (tokens). Enables rotating cache for long contexts. "
             "None = unlimited. Example: 4096 for memory-constrained scenarios."
@@ -470,23 +470,23 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Minimum tokens before allowing </think> closure."},
     )
     max_think_tokens: int = field(
-        default=120,
+        default=512,
         metadata={"help": "Start strong bias toward </think> closure."},
     )
     think_close_bias_start: int = field(
-        default=10,
+        default=5,
         metadata={"help": "Position to start gentle bias toward </think>."},
     )
     think_close_bias_value: float = field(
-        default=6.0,
+        default=26.0,
         metadata={"help": "Initial bias magnitude (logit addition)."},
     )
     think_close_bias_decay: float = field(
-        default=0.995,
+        default=0.095,
         metadata={"help": "Bias decay per step (0.995 = slow decay)."},
     )
     force_close_after: int = field(
-        default=96,
+        default=620,
         metadata={"help": "Absolute maximum - force </think> closure."},
     )
     sampler_verbose: bool = field(
@@ -496,7 +496,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Performance optimizations (✅ ENABLED BY DEFAULT)
     use_compilation: bool = field(
-        default=True,  # ✅ CHANGED from False - 7x speedup
+        default=False,  # ✅ CHANGED from False - 7x speedup
         metadata={"help": "Use MLX compilation for 7x speedup (recommended)."},
     )
     aggressive_gc: bool = field(
@@ -530,7 +530,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Track KL spikes for analysis."},
     )
     kl_spike_threshold: float = field(
-        default=5.0,
+        default=0.1,
         metadata={"help": "KL threshold for spike detection."},
     )
 

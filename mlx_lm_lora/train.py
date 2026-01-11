@@ -214,14 +214,14 @@ def build_parser():
         "--optimizer",
         type=str,
         choices=["adam", "adamw", "qhadam", "muon"],
-        default=None,
+        default="adamw",
         help="Optimizer to use for training: adam or adamw",
     )
     parser.add_argument(
         "--mask-prompt",
         action="store_true",
         help="Mask the prompt in the loss when training",
-        default=None,
+        default=True,
     )
     parser.add_argument(
         "--num-layers",
