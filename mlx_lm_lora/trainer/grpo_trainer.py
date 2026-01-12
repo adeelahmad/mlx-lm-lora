@@ -72,7 +72,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx_lm.utils import (
+    compute_bits_per_weight,
+    load,
+    quantize_model,
+    save,tree_flatten, tree_map, tree_unflatten
+)
 from mlx_lm.generate import batch_generate, generate
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.models import cache as mlx_cache
@@ -1660,11 +1665,11 @@ class MultiActorGRPO:
         sync_frequency: int = 10,
         verbose: bool = True,
         # Gradient similarity
-        gradient_similarity_enabled: bool = False,
+        gradient_similarity_enabled: bool = True,
         gradient_similarity_threshold: float = 0.95,
         gradient_similarity_metric: str = "cosine",
         # Actor divergence
-        divergence_mode: str = "none",
+        divergence_mode: str = "both",
         divergence_scale: float = 0.01,
         # Grad checkpointing
         grad_checkpoint_layers: Optional[List[int]] = None,
@@ -1775,6 +1780,7 @@ class MultiActorGRPO:
         actor = copy.deepcopy(self.main_actor)
         actor.train()
 
+
         # Apply divergence if configured
         if self.divergence_mode in ["noise", "both"]:
             self._apply_weight_noise(actor, actor_idx)
@@ -1783,8 +1789,7 @@ class MultiActorGRPO:
         if self.grad_checkpoint_layers is not None or self.grad_checkpoint_frequency > 1:
             self._apply_grad_checkpointing(actor)
 
-        self._current_actor = actor
-        self._current_config = config
+        self._current_actor, self._current_config =  quantize_model(model=actor, config=config, bits=2)
 
         if self.verbose:
             extra = ""
@@ -2935,7 +2940,7 @@ def _generate_with_biased_sampler(
                 prompt_cache = mlx_cache.make_prompt_cache(model)
 
                 # Stage 1: Generate thinking until </think>
-                thinking_max_tokens = min(max_tokens, force_close_after + 200)
+                thinking_max_tokens = min(max_tokens, force_close_after + 50)
                 thinking_completion = generate(
                     model=model,
                     tokenizer=tokenizer,
@@ -4193,6 +4198,9 @@ def train_grpo(
                     actor_metadata=ordered_actor_metadata,
                 )
 
+                mx.eval(actor_grad)  # Force sync before accumulation
+
+
                 # Accumulate logging data for combined logging later
                 total_rewards_list = reward_metrics.get("total_rewards", []) if reward_metrics else []
                 individual_rewards_dict = reward_metrics.get("individual_rewards", {}) if reward_metrics else {}
@@ -4246,12 +4254,12 @@ def train_grpo(
                     kl=actor_kl,
                 )
 
-                # 7. Unload actor to free memory
-                del actor_grad, actor_loss_value_and_grad
-                del completions, completion_texts, ordered_completions
-                del advantages, reward_metrics
-                multi_actor._unload_current_actor()
-                mx.clear_cache()
+                # # 7. Unload actor to free memory
+                # del actor_grad, actor_loss_value_and_grad
+                # del completions, completion_texts, ordered_completions
+                # del advantages, reward_metrics
+                # multi_actor._unload_current_actor()
+                # mx.clear_cache()
 
             # 8. Get averaged gradients
             averaged_grads = multi_actor.get_averaged_gradients()
