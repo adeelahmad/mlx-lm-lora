@@ -1793,8 +1793,8 @@ class MultiActorGRPO:
         self._current_config = config
 
 
-
-        self._current_actor, _ =  quantize_model(model=actor, config=self.model_config, bits=2,group_size=32)
+        self._current_actor = actor
+        # self._current_actor, _ =  quantize_model(model=actor, config=self.model_config, bits=2,group_size=32)
 
         if self.verbose:
             extra = ""
@@ -4260,11 +4260,11 @@ def train_grpo(
                 )
 
                 # # 7. Unload actor to free memory
-                # del actor_grad, actor_loss_value_and_grad
-                # del completions, completion_texts, ordered_completions
-                # del advantages, reward_metrics
-                # multi_actor._unload_current_actor()
-                # mx.clear_cache()
+                del actor_grad, actor_loss_value_and_grad
+                del completions, completion_texts, ordered_completions
+                del advantages, reward_metrics
+                multi_actor._unload_current_actor()
+                mx.clear_cache()
 
             # 8. Get averaged gradients
             averaged_grads = multi_actor.get_averaged_gradients()
@@ -4272,6 +4272,12 @@ def train_grpo(
                 grad = tree_unflatten(list(averaged_grads.items()))
             else:
                 grad = None
+
+
+            # ADD THIS - Final cleanup of any remaining actor
+            multi_actor._unload_current_actor()  # Ensure last actor is unloaded
+            gc.collect()
+            mx.clear_cache()
 
             # Average metrics
             lvalue = total_loss / multi_actor.num_actors if multi_actor.num_actors > 0 else 0.0

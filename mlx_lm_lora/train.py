@@ -21,9 +21,9 @@ Fixes:
 - Made LoRA config configurable (not hardcoded)
 - GRPO now correctly uses raw dataset (not CacheDataset)
 """
-# At start of training
-import mlx.core as mx
-mx.metal.set_memory_limit(88 * 1024**3)  # 48GB limit
+# # At start of training
+# import mlx.core as mx
+# mx.metal.set_memory_limit(88 * 1024**3)  # 48GB limit
 
 from pathlib import Path
 import importlib.util
