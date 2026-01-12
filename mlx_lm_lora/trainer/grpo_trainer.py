@@ -76,7 +76,7 @@ from mlx_lm.utils import (
     compute_bits_per_weight,
     load,
     quantize_model,
-    save,tree_flatten, tree_map, tree_unflatten
+    save,tree_flatten, tree_map, tree_unflatten, load_config
 )
 from mlx_lm.generate import batch_generate, generate
 from mlx_lm.sample_utils import make_sampler
@@ -1677,6 +1677,7 @@ class MultiActorGRPO:
     ):
         self.main_actor = main_actor
         self.model_path = model_path
+        self.model_config = load_config(Path(model_path))
         self.tokenizer = tokenizer
         self.lora_params = lora_params
         self.sync_mode = sync_mode
@@ -1789,7 +1790,11 @@ class MultiActorGRPO:
         if self.grad_checkpoint_layers is not None or self.grad_checkpoint_frequency > 1:
             self._apply_grad_checkpointing(actor)
 
-        self._current_actor, self._current_config =  quantize_model(model=actor, config=config, bits=2)
+        self._current_config = config
+
+
+
+        self._current_actor, _ =  quantize_model(model=actor, config=self.model_config, bits=2,group_size=32)
 
         if self.verbose:
             extra = ""

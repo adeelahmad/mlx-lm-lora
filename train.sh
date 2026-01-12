@@ -57,6 +57,7 @@ while true; do
     # "nice -n -20" is sufficient to force P-Core usage.
     # sudo cp /Users/adeelahmad/work/mlx-grpo-trainer/outputsz/checkpoints/best_model/latest/model.safetensors  /Users/adeelahmad/.cache/lm-studio/models/lmstudio-community/Qwen-4B-Thinking-2507.z/ || echo "NO MODEL" && sudo rm -rf /Users/adeelahmad/work/mlx-grpo-trainer/outputsz/checkpoints
     # sudo
+    Model=${Model:-/Users/adeelahmad/work/SiLLM-examples/helpsteer/mlx-grpo/outy1266_align_last32/latest}
     sudo nice -n -20 env \
         OMP_NUM_THREADS=16 \
         OMP_THREAD_LIMIT=16 \
@@ -65,35 +66,35 @@ while true; do
         TOKENIZERS_PARALLELISM=false \
         PYTORCH_ENABLE_MPS_FALLBACK=1 \
         mlx_lm_lora.train \
-          --model $Model \
-          --reference-model-path $Model \
-          --load-in-4bits --train \
-          --data /Users/adeelahmad/work/SiLLM-examples/helpsteer/mlx-grpo/strat \
-           --train-mode grpo \
-          --grpo-loss-type dr_grpo \
-          --group-size 2 \
-          --epsilon 1e-4 \
-          --epsilon-high 0.08 --beta 0.08 \
-          --temperature 0.8 \
-          --learning-rate 5e-6 \
-          --max-completion-length 512 \
-          --importance-sampling-level sequence \
-          --gradient-accumulation-steps 8 \
-          --steps-per-report 1 \
-          --steps-per-eval 50 \
-          --wandb mlx-lm-grpo-v3.14 \
-          --save-every 8 \
-          --iters 1000 \
-          --batch-size 1 \
-          --seed $RANDOM \
-          --val-batches 1 \
-          --fuse \
-          --adapter-path adapters/turn78 \
-          --optimizer adamw \
-          --num-layers -1  \
-          --reward-functions "r1_semantic_similarity_reward,r1_conditional_content_reward,r1_velocity_to_correct_thinking_reward,r1_format_reward,r1_tag_structure_reward,r1_thinking_quality_reward" \
-          --reward-weights "[0.25, 0.25, 0.20, 0.10, 0.10, 0.10]" --train-type lora \
-          --reward-scaling 1.0 --resume-adapter-file adapters/turn78/adapters.safetensors
+                  --model $Model \
+                  --reference-model-path $Model \
+                   --train \
+                  --data /Users/adeelahmad/work/SiLLM-examples/helpsteer/mlx-grpo/strat \
+                   --train-mode grpo \
+                  --grpo-loss-type dr_grpo \
+                  --group-size 2 \
+                  --epsilon 1e-4 \
+                  --epsilon-high 0.05 --beta 0.03 \
+                  --temperature 0.8 \
+                  --learning-rate 1e-6 \
+                  --max-seq-length 1024 \
+                  --importance-sampling-level sequence \
+                  --gradient-accumulation-steps 1 \
+                  --steps-per-report 1 \
+                  --steps-per-eval 50 \
+                  --wandb mlx-lm-grpo-v4.9 \
+                  --save-every 4 \
+                  --iters 1000 \
+                  --batch-size 1 \
+                  --seed $RANDOM \
+                  --val-batches 1 \
+                  --fuse \
+                  --adapter-path adapters/turn4 \
+                  --optimizer adamw \
+                  --num-layers -1  \
+                  --reward-functions "r1_semantic_similarity_reward,r1_conditional_content_reward,r1_velocity_to_correct_thinking_reward,r1_format_reward,r1_tag_structure_reward,r1_thinking_quality_reward" \
+                  --reward-weights "[0.25, 0.25, 0.20, 0.10, 0.10, 0.10]" --train-type lora --load-in-4bits \
+                  --num-actors 2 --actor-quantizations "2bit,2bit" --actor-kl-to-main-weight 0.1 --actor-sync-mode main_to_actors
 
 
         # sudo cp /Users/adeelahmad/work/mlx-grpo-trainer/outputsz/checkpoints/best_model/latest/model.safetensors  /Users/adeelahmad/.cache/lm-studio/models/lmstudio-community/Qwen-4B-Thinking-2507.z/ || echo "NO MODEL" && sudo rm -rf /Users/adeelahmad/work/mlx-grpo-trainer/outputsz/checkpoints
