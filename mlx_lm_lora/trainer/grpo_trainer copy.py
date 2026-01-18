@@ -11,7 +11,7 @@ Architecture Philosophy:
 - Professional logging and monitoring
 - Multi-Actor diverse policy exploration (NEW)
 
-Version: 5.4.3 - HOTFIX: ARGUMENT COLLISION
+Version: 5.4.4 - HOTFIX: GRADIENT ARGUMENT BINDING
 Author: Synthesis of battle-tested production code + cutting-edge optimizations
 Last Updated: 2025-01-28
 
@@ -638,7 +638,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Upper epsilon for clipping. Defaults to epsilon if None."},
     )
     max_completion_length: int = field(
-        default=2048, metadata={"help": "Maximum tokens to generate per completion."}
+        default=120, metadata={"help": "Maximum tokens to generate per completion."}
     )
     reference_model_path: Optional[str] = field(
         default=None,
@@ -2708,7 +2708,7 @@ def _generate_with_biased_sampler(
                     verbose=sampler_verbose,
                 )
                 prompt_cache = mlx_cache.make_prompt_cache(model)
-                thinking_max_tokens = min(max_tokens, force_close_after + 200)
+                thinking_max_tokens = min(max_tokens, force_close_after + 50)
                 thinking_completion = generate(
                     model=model,
                     tokenizer=tokenizer,
@@ -2733,7 +2733,7 @@ def _generate_with_biased_sampler(
                     )
                     full_prompt = prompt_text + thinking_completion
                     answer_max_tokens = max(
-                        500, max_tokens - len(tokenizer.encode(thinking_completion))
+                        256, max_tokens - len(tokenizer.encode(thinking_completion))
                     )
                     answer_completion = generate(
                         model=model,
@@ -3429,7 +3429,9 @@ def train_grpo(
             new_lr = scheduler.get_lr(it)
             optimizer.learning_rate = mx.array(new_lr)
 
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+        if args.steps_per_eval >= 0 and (
+            it == 1 or it % args.steps_per_eval == 0 or it == args.iters
+        ):
             val_loss, val_tokens, val_metrics = evaluate_grpo(
                 model,
                 ref_model,
@@ -3513,9 +3515,9 @@ def train_grpo(
             args.reward_weights,
         )
 
+        # Removed 'model=model' keyword argument to fix TypeError
         (lvalue, toks, metrics), grads = compute_loss_and_grads(
             model,
-            model=model,
             ref_model=ref_model,
             batch=batch,
             completions=completions,

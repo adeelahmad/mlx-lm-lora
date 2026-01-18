@@ -343,6 +343,8 @@ def build_parser():
     parser.add_argument("--test", action="store_true", default=None)
     parser.add_argument("--test-batches", type=int)
     parser.add_argument("--max-seq-length", type=int)
+    parser.add_argument("--max-completion-length", type=int, default=128)
+
     parser.add_argument("-c", "--config", type=str, help="YAML config.")
     parser.add_argument("--grad-checkpoint", action="store_true", default=None)
     parser.add_argument("--wandb", type=str, default=None)
@@ -374,7 +376,7 @@ def build_parser():
 
     # GRPO Core
     parser.add_argument("--group-size", type=int, default=2)
-    parser.add_argument("--max-completion-length", type=int, default=512)
+    # parser.add_argument("--max-completion-length", type=int, default=512)
     parser.add_argument("--epsilon", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--reward-weights", type=str, default=1.3)
@@ -397,22 +399,22 @@ def build_parser():
 
     # GRPO Phased
     parser.add_argument("--use-phased-generation", action="store_true", default=True)
-    parser.add_argument("--phased-thinking-max-tokens", type=int, default=320)
-    parser.add_argument("--phased-answer-max-tokens", type=int, default=256)
-    parser.add_argument("--phased-min-thinking-tokens", type=int, default=60)
+    parser.add_argument("--phased-thinking-max-tokens", type=int, default=24)
+    parser.add_argument("--phased-answer-max-tokens", type=int, default=40)
+    parser.add_argument("--phased-min-thinking-tokens", type=int, default=10)
 
     # GRPO Sampling
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--min-tokens-to-keep", type=int, default=1)
-    parser.add_argument("--repetition-penalty", type=float, default=1.1)
+    parser.add_argument("--repetition-penalty", type=float, default=1.2)
     parser.add_argument("--use-biased-sampler", action="store_true", default=False)
 
     # GRPO Tracking & Optimization
-    parser.add_argument("--track-diversity", action="store_true", default=True)
-    parser.add_argument("--track-kl-spikes", action="store_true", default=True)
-    parser.add_argument("--use-compilation", action="store_true", default=False)
+    parser.add_argument("--track-diversity", action="store_true", default=False)
+    parser.add_argument("--track-kl-spikes", action="store_true", default=False)
+    parser.add_argument("--use-compilation", action="store_true", default=True)
     parser.add_argument("--aggressive-gc", action="store_true", default=True)
     parser.add_argument("--log-samples", action="store_true", default=True)
 
@@ -465,6 +467,9 @@ def build_parser():
     parser.add_argument("--think-start-token", type=str, default="<think>")
     parser.add_argument("--think-end-token", type=str, default="</think>")
     parser.add_argument("--answer-start-token", type=str, default=None)
+
+    logging.debug("Args:")
+    logging.debug(parser)
 
     return parser
 
