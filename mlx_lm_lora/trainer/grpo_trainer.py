@@ -3517,7 +3517,6 @@ def train_grpo(
 
         (lvalue, toks, metrics), grads = compute_loss_and_grads(
             model,
-            model=model,
             ref_model=ref_model,
             batch=batch,
             completions=completions,
