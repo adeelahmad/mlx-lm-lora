@@ -5,22 +5,16 @@ GRPO Reward Functions Module - PRODUCTION VERSION
 Comprehensive collection of reward functions for Reinforcement Learning on LLMs.
 Optimized for Group Relative Policy Optimization (GRPO) training pipelines.
 
-Version: 5.0.0 (Enhanced Structure & Velocity)
-Last Updated: 2025-01-28
-
-Changelog v5.0.0:
-- ✅ ADDED: r1_global_structural_integrity_reward (The "Always Run" Guardian)
-- ✅ UPGRADED: VCTR now includes "Structural Fingerprinting" (Code/Heading positioning)
-- ✅ IMPROVED: r1_extract_xml_answer handles "The answer is" prefixes
-- ✅ IMPROVED: Code block position matching logic in VCTR
-- ✅ FIXED: Reward normalization edge cases
-- ✅ PRESERVED: Full backward compatibility
+Version: 4.2.0 (CLI Fix - Restored Missing Reward Functions)
+Last Updated: 2025-01-18
 
 Features:
 - All rewards STRICTLY normalized to [0, 1]
+- Zero-dependency core (Soft dependencies handled)
+- Full backward compatibility with existing CLI/configs
 - Phase-aware rewards for thinking models
 - Type-aware reward weight adjustments
-- Structural fingerprinting for code/math/markdown
+- Integrated Anti-Verbosity and Efficiency checks
 """
 
 import re
@@ -71,16 +65,10 @@ REWARD_REGISTRY: Dict[str, RewardFunctions] = {}
 RE_THINK_EXTRACT = re.compile(r"<think>(.*?)</think>\s*(.*)", re.DOTALL)
 RE_ANSWER_TAGS = re.compile(r"</?answer>")
 RE_ANSWER_EXTRACT = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
-RE_ANSWER_PREFIX_CLEAN = re.compile(r"^(the\s+)?answer\s+is[:\s]*", re.IGNORECASE)
 
 # Format validation
 RE_STRICT_FORMAT = re.compile(r"^<think>\n[\s\S]*?\n</think>\n[\s\S]*$")
 RE_STRUCTURED_LIST = re.compile(r"(\n\s*[-*•]|\n\s*\d+\.\s+)")
-
-# Structure Fingerprinting (New in v5.0.0)
-RE_CODE_BLOCK_START = re.compile(r"```(\w+)?")
-RE_HEADING = re.compile(r"^#{1,6}\s", re.MULTILINE)
-RE_LATEX_BLOCK = re.compile(r"\$\$[\s\S]*?\$\$")
 
 # MCQ patterns
 RE_MCQ_OPTION = re.compile(
@@ -110,12 +98,14 @@ RE_EMOJI = re.compile(
     "]+"
 )
 
+# Tokenization
 RE_WORD_TOKENS = re.compile(r"\w+")
 
 # =============================================================================
-# PATTERN SETS
+# PRE-COMPILED PATTERN SETS
 # =============================================================================
 
+# Thinking quality - bad phrases
 _BAD_PHRASES_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -139,8 +129,10 @@ _BAD_PHRASES_PATTERNS = [
     ]
 ]
 
+# Special tokens to penalize
 _SPECIAL_TOKENS = ["<|endoftext|>", "<|im_start|>", "<think><think>", "<|im_end|>"]
 
+# Conditional content patterns
 _FALSE_IDENTITY_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -183,6 +175,7 @@ _STYLE_BAD_PATTERNS = [
     ]
 ]
 
+# Factual grounding patterns
 _EVIDENCE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -232,6 +225,7 @@ _MISINFO_PATTERNS = [
     ]
 ]
 
+# Moral reasoning patterns
 _MORAL_POSITIVE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -271,8 +265,13 @@ _MORAL_REASONING_PATTERNS = [
     ]
 ]
 
+# =============================================================================
+# UNWANTED CONTENT SET
+# =============================================================================
+
 _UNWANTED_SET = frozenset(
     {
+        # AI Identity & Refusals
         "as an ai",
         "i cannot",
         "cannot fulfill",
@@ -294,6 +293,7 @@ _UNWANTED_SET = frozenset(
         "knowledge cutoff",
         "openai",
         "anthropic",
+        # Meta-Cognitive
         "let me think",
         "let me start",
         "first thought",
@@ -306,14 +306,17 @@ _UNWANTED_SET = frozenset(
         "thanks for asking",
         "you got it",
         "i recall that",
+        # Hate Speech & Harm (subset)
         "hate speech",
         "supremacy",
         "genocide",
         "bioweapon",
         "chemical weapon",
+        # Illegal & Explicit (subset)
         "drug trafficking",
         "money laundering",
         "cyberbullying",
+        # Misinformation
         "flat earth",
         "chemtrails",
         "illuminati",
@@ -322,6 +325,10 @@ _UNWANTED_SET = frozenset(
         "anti-vax",
     }
 )
+
+# =============================================================================
+# CONTRACTIONS
+# =============================================================================
 
 CONTRACTIONS = {
     "n't": " not",
@@ -359,7 +366,10 @@ CONTRACTIONS = {
 
 @dataclass
 class PhasedCompletion:
-    """Structured completion from phased generation."""
+    """
+    Structured completion from phased generation.
+    Provides clean access to thinking and answer phases with metadata.
+    """
 
     thinking: str = ""
     answer: str = ""
@@ -370,6 +380,7 @@ class PhasedCompletion:
     def from_text(
         cls, text: str, phase_outputs: Optional[List[Dict]] = None
     ) -> "PhasedCompletion":
+        """Parse from raw text (backward compatible)."""
         if not text:
             return cls(raw_text="")
 
@@ -381,8 +392,12 @@ class PhasedCompletion:
                 phase_name = phase.get("phase", phase.get("name", ""))
                 if phase_name in ("thinking", "think"):
                     metadata["thinking_tokens"] = phase.get("tokens", 0)
+                    metadata["thinking_hit_stop"] = phase.get("hit_stop", False)
+                    metadata["thinking_time"] = phase.get("time", 0.0)
                 elif phase_name in ("answer", "response"):
                     metadata["answer_tokens"] = phase.get("tokens", 0)
+                    metadata["answer_hit_stop"] = phase.get("hit_stop", False)
+                    metadata["answer_time"] = phase.get("time", 0.0)
 
         return cls(
             thinking=thinking or "",
@@ -390,6 +405,14 @@ class PhasedCompletion:
             raw_text=text,
             phase_metadata=metadata,
         )
+
+    def to_text(self) -> str:
+        """Convert back to raw text format."""
+        if self.raw_text:
+            return self.raw_text
+        if self.thinking:
+            return f"<think>{self.thinking}</think>{self.answer}"
+        return self.answer
 
     @property
     def has_thinking(self) -> bool:
@@ -402,16 +425,20 @@ class PhasedCompletion:
 
 
 def _extract_components(text: str) -> Tuple[Optional[str], str]:
-    """Extract (thinking_content, answer_content) from completion."""
+    """
+    Extract (thinking_content, answer_content) from completion.
+    """
     if not text:
         return None, ""
 
+    # No think tags
     if "<think>" not in text:
         answer_match = RE_ANSWER_EXTRACT.search(text)
         if answer_match:
             return None, answer_match.group(1).strip()
         return None, text.strip()
 
+    # Has <think> tag
     match = RE_THINK_EXTRACT.search(text)
     if match:
         thinking_content = match.group(1).strip()
@@ -419,6 +446,7 @@ def _extract_components(text: str) -> Tuple[Optional[str], str]:
         answer_content = RE_ANSWER_TAGS.sub("", answer_content).strip()
         return thinking_content, answer_content
 
+    # Partial tags
     if "<think>" in text and "</think>" not in text:
         return None, ""
 
@@ -426,28 +454,32 @@ def _extract_components(text: str) -> Tuple[Optional[str], str]:
 
 
 def r1_extract_xml_answer(text: str) -> str:
-    """Extract answer from completion, cleaning prefixes."""
+    """
+    Extract answer from completion. Priority:
+    1. <answer> tags
+    2. Content after </think>
+    3. Full text if no tags
+    """
     if not text:
         return ""
 
-    answer_text = ""
     answer_match = RE_ANSWER_EXTRACT.search(text)
     if answer_match:
-        answer_text = answer_match.group(1).strip()
-    elif "</think>" in text:
-        after_think = text.split("</think>", 1)[-1]
-        answer_text = RE_ANSWER_TAGS.sub("", after_think).strip()
-    elif "<think>" in text and "</think>" not in text:
-        return ""
-    else:
-        answer_text = text.strip()
+        return answer_match.group(1).strip()
 
-    # Clean "The answer is" prefixes
-    answer_text = RE_ANSWER_PREFIX_CLEAN.sub("", answer_text)
-    return answer_text
+    if "</think>" in text:
+        after_think = text.split("</think>", 1)[-1]
+        after_think = RE_ANSWER_TAGS.sub("", after_think)
+        return after_think.strip()
+
+    if "<think>" in text and "</think>" not in text:
+        return ""
+
+    return text.strip()
 
 
 def _clean_text_basic(text: str) -> str:
+    """Robust text cleaner for similarity comparison."""
     if not text:
         return ""
     text = text.lower()
@@ -484,6 +516,8 @@ def _jaccard_similarity(text1: str, text2: str) -> float:
 
 
 def validate_inputs(func: RewardFunctions) -> RewardFunctions:
+    """Decorator to validate inputs and ensure scores are in [0, 1]."""
+
     @functools.wraps(func)
     def wrapper(
         prompts: List[str],
@@ -491,39 +525,43 @@ def validate_inputs(func: RewardFunctions) -> RewardFunctions:
         answer: List[str],
         types: Optional[List[str]] = None,
     ) -> List[float]:
+        # Handle empty completions
         if not completions:
+            logger.warning(f"{func.__name__}: Empty completions list, returning zeros")
             return [0.0] * max(len(prompts) if prompts else 1, 1)
 
+        # Normalize lengths
+        len_c = len(completions)
+
+        # Adjust answers
         current_answers = answer
-        if len(completions) != len(answer):
+        if len(answer) != len_c:
             if len(answer) == 1:
-                current_answers = [answer[0]] * len(completions)
-            elif len(answer) > len(completions):
-                current_answers = answer[: len(completions)]
+                current_answers = [answer[0]] * len_c
+            elif len(answer) > len_c:
+                current_answers = answer[:len_c]
             else:
-                current_answers = answer + [answer[-1]] * (
-                    len(completions) - len(answer)
-                )
+                current_answers = answer + [answer[-1]] * (len_c - len(answer))
 
+        # Adjust prompts
         current_prompts = prompts
-        if prompts and len(prompts) != len(completions):
+        if prompts and len(prompts) != len_c:
             if len(prompts) == 1:
-                current_prompts = [prompts[0]] * len(completions)
-            elif len(prompts) > len(completions):
-                current_prompts = prompts[: len(completions)]
+                current_prompts = [prompts[0]] * len_c
+            elif len(prompts) > len_c:
+                current_prompts = prompts[:len_c]
             else:
-                current_prompts = prompts + [prompts[-1]] * (
-                    len(completions) - len(prompts)
-                )
+                current_prompts = prompts + [prompts[-1]] * (len_c - len(prompts))
 
+        # Adjust types
         current_types = types
-        if types and len(types) != len(completions):
+        if types and len(types) != len_c:
             if len(types) == 1:
-                current_types = [types[0]] * len(completions)
-            elif len(types) > len(completions):
-                current_types = types[: len(completions)]
+                current_types = [types[0]] * len_c
+            elif len(types) > len_c:
+                current_types = types[:len_c]
             else:
-                current_types = types + [types[-1]] * (len(completions) - len(types))
+                current_types = types + [types[-1]] * (len_c - len(types))
 
         try:
             scores = func(current_prompts, completions, current_answers, current_types)
@@ -534,11 +572,17 @@ def validate_inputs(func: RewardFunctions) -> RewardFunctions:
                 else:
                     validated_scores.append(max(0.0, min(1.0, float(s))))
             return validated_scores
+
         except Exception as e:
             logger.error(f"{func.__name__} CRASHED: {e}", exc_info=True)
             return [0.0] * len(completions)
 
     return wrapper
+
+
+# =============================================================================
+# REGISTRY FUNCTIONS
+# =============================================================================
 
 
 def register_reward_function(name: str = None):
@@ -553,17 +597,14 @@ def register_reward_function(name: str = None):
 
 def get_reward_function(name: str) -> RewardFunctions:
     if name not in REWARD_REGISTRY:
-        raise KeyError(f"Reward function '{name}' not found.")
+        available = ", ".join(sorted(REWARD_REGISTRY.keys()))
+        raise KeyError(f"Reward function '{name}' not found. Available: {available}")
     return REWARD_REGISTRY[name]
 
 
 def get_default_reward_functions() -> List[RewardFunctions]:
-    """Returns list of default reward functions, including the Global Guardian."""
+    """Get default set of reward functions for GRPO training."""
     return [
-        REWARD_REGISTRY.get(
-            "r1_global_structural_integrity_reward",
-            r1_global_structural_integrity_reward,
-        ),  # Always run first
         REWARD_REGISTRY.get("r1_accuracy_reward_func", r1_accuracy_reward_func),
         REWARD_REGISTRY.get(
             "r1_semantic_similarity_reward", r1_semantic_similarity_reward
@@ -574,243 +615,429 @@ def get_default_reward_functions() -> List[RewardFunctions]:
     ]
 
 
+# =============================================================================
+# ANTI-VERBOSITY & EFFICIENCY REWARDS
+# =============================================================================
+
+
+@register_reward_function("r1_conciseness_reward")
+def r1_conciseness_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """
+    Conciseness Reward - Type-Aware Length Optimization.
+    Penalizes both too short (incomplete) and too long (verbose).
+    """
+    scores = []
+    # Target Ranges: (min, optimal_low, optimal_high, max_acceptable)
+    TYPE_TARGETS = {
+        "math": (20, 50, 200, 300),
+        "code": (50, 100, 400, 600),
+        "essay": (100, 200, 600, 1000),
+        "mcq": (10, 20, 100, 150),
+        "reasoning": (40, 80, 300, 500),
+    }
+    DEFAULT_TARGET = (20, 50, 300, 500)
+
+    for i, text in enumerate(completions):
+        if not text or len(text.strip()) < 10:
+            scores.append(0.0)
+            continue
+
+        qtype = types[i].lower() if types and i < len(types) and types[i] else None
+        min_len, opt_low, opt_high, max_accept = TYPE_TARGETS.get(qtype, DEFAULT_TARGET)
+
+        tokens = len(text.split())
+
+        if tokens < min_len:
+            score = max(0.2, tokens / min_len)
+        elif opt_low <= tokens <= opt_high:
+            score = 1.0
+        elif tokens <= max_accept:
+            excess_ratio = (tokens - opt_high) / (max_accept - opt_high)
+            score = 1.0 - (0.3 * excess_ratio)
+        else:
+            excess_ratio = (tokens - max_accept) / max_accept
+            score = max(0.1, 0.7 - (0.4 * min(excess_ratio, 3.0)))
+
+        scores.append(score)
+    return scores
+
+
+@register_reward_function("r1_repetition_penalty_reward")
+def r1_repetition_penalty_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """
+    Repetition Penalty Reward - Detects Semantic Duplication.
+    """
+    scores = []
+
+    def compute_ngram_repetition(text: str, n: int = 4) -> float:
+        words = text.lower().split()
+        if len(words) < n:
+            return 0.0
+        ngrams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+        if not ngrams:
+            return 0.0
+        return 1.0 - (len(set(ngrams)) / len(ngrams))
+
+    def compute_sentence_similarity(text: str) -> float:
+        sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 10]
+        if len(sentences) < 2:
+            return 0.0
+        similarities = []
+        for i in range(len(sentences)):
+            for j in range(i + 1, len(sentences)):
+                sim = difflib.SequenceMatcher(None, sentences[i], sentences[j]).ratio()
+                similarities.append(sim)
+        return sum(similarities) / len(similarities) if similarities else 0.0
+
+    for text in completions:
+        if not text or len(text.strip()) < 20:
+            scores.append(1.0)
+            continue
+
+        think, ans = _extract_components(text)
+        full_text = (think or "") + " " + ans
+        score = 1.0
+
+        ngram_rep = compute_ngram_repetition(full_text, n=4)
+        if ngram_rep > 0.3:
+            score -= min(0.4, ngram_rep)
+
+        if think and len(think.split()) > 50:
+            sent_sim = compute_sentence_similarity(think)
+            if sent_sim > 0.7:
+                score -= 0.3
+
+        common_phrases = ["i think", "let me", "okay", "wait", "hmm", "so basically"]
+        for phrase in common_phrases:
+            count = full_text.lower().count(phrase)
+            if count > 3:
+                score -= min(0.2, 0.05 * (count - 3))
+
+        scores.append(score)
+    return scores
+
+
+@register_reward_function("r1_information_density_reward")
+def r1_information_density_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Information Density Reward - Signal-to-Noise Ratio."""
+    scores = []
+
+    INFO_MARKERS = {
+        "numbers": re.compile(r"\b\d+(?:\.\d+)?(?:%|kg|m|km|GB|MB)?\b"),
+        "technical": re.compile(r"\b[A-Z]{2,}|\w+_\w+|[a-z]+\(\)|<[^>]+>"),
+        "citations": re.compile(
+            r"according to|research shows|study found|data indicates"
+        ),
+    }
+    FILLER_WORDS = {
+        "basically",
+        "actually",
+        "literally",
+        "really",
+        "very",
+        "quite",
+        "somewhat",
+        "rather",
+        "fairly",
+        "pretty",
+        "kind of",
+        "sort of",
+    }
+
+    for text in completions:
+        if not text or len(text.strip()) < 20:
+            scores.append(0.5)
+            continue
+
+        _, ans = _extract_components(text)
+        words = ans.lower().split()
+        total_words = len(words)
+        if total_words < 10:
+            scores.append(0.5)
+            continue
+
+        score = 0.6
+        if INFO_MARKERS["numbers"].search(ans):
+            score += 0.1
+        if INFO_MARKERS["technical"].search(ans):
+            score += 0.1
+        if INFO_MARKERS["citations"].search(ans):
+            score += 0.1
+
+        filler_count = sum(1 for word in words if word in FILLER_WORDS)
+        if (filler_count / total_words) > 0.2:
+            score -= 0.3
+
+        scores.append(score)
+    return scores
+
+
+@register_reward_function("r1_thinking_efficiency_reward")
+def r1_thinking_efficiency_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Thinking Efficiency Reward - Quality per Token."""
+    scores = []
+    OPTIMAL_THINKING = {
+        "math": (20, 100),
+        "code": (30, 150),
+        "essay": (50, 200),
+        "mcq": (10, 50),
+        "reasoning": (30, 120),
+    }
+    DEFAULT_OPTIMAL = (20, 100)
+
+    for i, text in enumerate(completions):
+        think, ans = _extract_components(text)
+        ref = answer[i] if i < len(answer) else ""
+
+        is_correct = ans.strip().lower() == ref.strip().lower()
+        score = 0.5 if is_correct else 0.2
+
+        if not think:
+            scores.append(score * 0.5)
+            continue
+
+        qtype = types[i].lower() if types and i < len(types) and types[i] else None
+        opt_min, opt_max = OPTIMAL_THINKING.get(qtype, DEFAULT_OPTIMAL)
+        think_tokens = len(think.split())
+
+        if opt_min <= think_tokens <= opt_max:
+            score += 0.3
+        elif think_tokens < opt_min:
+            score += 0.15 * (think_tokens / opt_min)
+        else:
+            excess = (think_tokens - opt_max) / opt_max
+            score += max(0.05, 0.3 - (0.2 * min(excess, 2.0)))
+
+        scores.append(score)
+    return scores
+
+
+# =============================================================================
+# CONFIGURATION GETTERS (Updated with Anti-Verbosity)
+# =============================================================================
+
+
+def get_default_reward_configs() -> Dict[str, Dict[str, Any]]:
+    """Get default reward configurations with weights and metadata."""
+    return {
+        "accuracy": {
+            "func": REWARD_REGISTRY.get(
+                "r1_accuracy_reward_func", r1_accuracy_reward_func
+            ),
+            "weight": 0.25,
+            "description": "Exact match accuracy",
+        },
+        "semantic": {
+            "func": REWARD_REGISTRY.get(
+                "r1_semantic_similarity_reward", r1_semantic_similarity_reward
+            ),
+            "weight": 0.20,
+            "description": "TF-IDF semantic similarity",
+        },
+        "thinking": {
+            "func": REWARD_REGISTRY.get(
+                "r1_thinking_quality_reward", r1_thinking_quality_reward
+            ),
+            "weight": 0.10,
+            "description": "Reasoning quality",
+        },
+        "answer_quality": {
+            "func": REWARD_REGISTRY.get(
+                "r1_answer_quality_reward", r1_answer_quality_reward
+            ),
+            "weight": 0.10,
+            "description": "Anti-gaming checks",
+        },
+        "format": {
+            "func": REWARD_REGISTRY.get("r1_format_reward", r1_format_reward),
+            "weight": 0.05,
+            "description": "Format compliance",
+        },
+        # Anti-verbosity rewards
+        "conciseness": {
+            "func": REWARD_REGISTRY.get("r1_conciseness_reward", r1_conciseness_reward),
+            "weight": 0.15,
+            "description": "Type-aware length optimization",
+        },
+        "repetition": {
+            "func": REWARD_REGISTRY.get(
+                "r1_repetition_penalty_reward", r1_repetition_penalty_reward
+            ),
+            "weight": 0.10,
+            "description": "Penalizes semantic duplication",
+        },
+        "efficiency": {
+            "func": REWARD_REGISTRY.get(
+                "r1_thinking_efficiency_reward", r1_thinking_efficiency_reward
+            ),
+            "weight": 0.05,
+            "description": "Quality per token",
+        },
+    }
+
+
+def get_type_adjusted_weights(question_type: Optional[str] = None) -> Dict[str, float]:
+    """Get reward weights adjusted for question type."""
+    DEFAULT_WEIGHTS = {
+        "accuracy": 0.25,
+        "semantic": 0.20,
+        "thinking": 0.10,
+        "answer_quality": 0.10,
+        "format": 0.05,
+        "conciseness": 0.15,
+        "repetition": 0.10,
+        "efficiency": 0.05,
+    }
+
+    TYPE_ADJUSTMENTS = {
+        "math": {
+            "accuracy": 0.40,
+            "conciseness": 0.20,
+            "thinking": 0.15,
+            "semantic": 0.10,
+            "efficiency": 0.10,
+            "answer_quality": 0.03,
+            "format": 0.01,
+            "repetition": 0.01,
+        },
+        "code": {
+            "accuracy": 0.35,
+            "conciseness": 0.15,
+            "efficiency": 0.15,
+            "thinking": 0.15,
+            "format": 0.10,
+            "semantic": 0.05,
+            "answer_quality": 0.03,
+            "repetition": 0.02,
+        },
+        "essay": {
+            "semantic": 0.30,
+            "thinking": 0.20,
+            "answer_quality": 0.15,
+            "conciseness": 0.15,
+            "accuracy": 0.10,
+            "repetition": 0.05,
+            "efficiency": 0.03,
+            "format": 0.02,
+        },
+        "mcq": {
+            "accuracy": 0.50,
+            "conciseness": 0.20,
+            "format": 0.15,
+            "efficiency": 0.10,
+            "thinking": 0.03,
+            "semantic": 0.01,
+            "answer_quality": 0.01,
+            "repetition": 0.00,
+        },
+        "reasoning": {
+            "thinking": 0.25,
+            "accuracy": 0.25,
+            "conciseness": 0.15,
+            "semantic": 0.15,
+            "efficiency": 0.10,
+            "repetition": 0.05,
+            "answer_quality": 0.03,
+            "format": 0.02,
+        },
+    }
+
+    if question_type and question_type.lower() in TYPE_ADJUSTMENTS:
+        weights = TYPE_ADJUSTMENTS[question_type.lower()]
+    else:
+        weights = DEFAULT_WEIGHTS.copy()
+
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-6:
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
+
+
 def list_available_reward_functions() -> List[str]:
     return sorted(list(REWARD_REGISTRY.keys()))
 
 
 # =============================================================================
-# GLOBAL GUARDIAN REWARD (Always Run)
+# PHASE-AWARE WRAPPER
 # =============================================================================
 
 
-@register_reward_function("r1_global_structural_integrity_reward")
-def r1_global_structural_integrity_reward(
-    prompts: List[str],
-    completions: List[str],
-    answer: List[str],
-    types: Optional[List[str]] = None,
-) -> List[float]:
-    """
-    The 'Guardian' Reward.
+def make_phase_aware_reward(
+    base_reward_func: RewardFunctions,
+    phase_weight_thinking: float = 0.3,
+    phase_weight_answer: float = 0.7,
+) -> RewardFunctions:
+    """Wrap a reward function to be phase-aware."""
 
-    Checks for catastrophic failures that should always result in a penalty,
-    regardless of user configuration.
+    @functools.wraps(base_reward_func)
+    def wrapper(
+        prompts: List[str],
+        completions: List[str],
+        answer: List[str],
+        types: Optional[List[str]] = None,
+        phase_outputs: Optional[List[List[Dict]]] = None,
+    ) -> List[float]:
+        if phase_outputs is None:
+            return base_reward_func(prompts, completions, answer, types)
 
-    Checks:
-    1. Empty generation.
-    2. Repetition loops (e.g., "I think I think I think").
-    3. Missing tags completely.
-
-    Returns:
-    - 1.0 if healthy.
-    - < 1.0 (penalty) if structural issues detected.
-    """
-    scores = []
-    for text in completions:
-        if not text or len(text.strip()) < 5:
-            scores.append(0.0)
-            continue
-
-        score = 1.0
-
-        # Check for repetition loops (simple heuristic: repeated 10-char chunks)
-        # Taking a sample from the middle
-        mid = len(text) // 2
-        sample = text[mid : mid + 20]
-        if len(sample) > 10 and text.count(sample) > 10:
-            score -= 0.5  # Major penalty for looping
-
-        # Check for empty tags <think></think>
-        if "<think></think>" in text or "<answer></answer>" in text:
-            score -= 0.3
-
-        # Check for broken tags
-        if text.count("<think>") != text.count("</think>"):
-            score -= 0.2
-
-        scores.append(max(0.0, score))
-    return scores
-
-
-# =============================================================================
-# VCTR REWARDS (Velocity to Correct Thinking) - v2.0
-# =============================================================================
-
-
-@dataclass
-class StructuralFingerprint:
-    code_blocks: int
-    headings: int
-    list_items: int
-    latex_blocks: int
-    relative_code_pos: float  # 0.0 to 1.0, -1 if none
-
-
-def _analyze_structure_fingerprint(text: str) -> StructuralFingerprint:
-    """Analyze text structure for VCTR matching."""
-    code_matches = list(RE_CODE_BLOCK_START.finditer(text))
-    code_blocks = len(code_matches)
-
-    headings = len(RE_HEADING.findall(text))
-    list_items = len(RE_STRUCTURED_LIST.findall(text))
-    latex_blocks = len(RE_LATEX_BLOCK.findall(text))
-
-    rel_pos = -1.0
-    if code_matches and len(text) > 0:
-        rel_pos = code_matches[0].start() / len(text)
-
-    return StructuralFingerprint(
-        code_blocks, headings, list_items, latex_blocks, rel_pos
-    )
-
-
-def _extract_thinking_lines(text: str) -> List[str]:
-    match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
-    if not match:
-        return []
-    return [line.strip() for line in match.group(1).split("\n") if line.strip()]
-
-
-def _compute_line_similarities(lines: List[str], reference: str) -> List[float]:
-    return [_jaccard_similarity(line, reference) for line in lines]
-
-
-def _compute_consistency_score(
-    thinking_lines: List[str], generated_answer: str
-) -> float:
-    if not thinking_lines or not generated_answer:
-        return 0.0
-    last_thought = thinking_lines[-1].lower()
-    ans_lines = [l.strip() for l in generated_answer.split("\n") if l.strip()]
-    if not ans_lines:
-        return 0.0
-    first_ans_line = ans_lines[0].lower()
-    if len(first_ans_line) < 5:
-        return 0.0
-    return difflib.SequenceMatcher(None, last_thought, first_ans_line).ratio()
-
-
-@register_reward_function("r1_velocity_to_correct_thinking_reward")
-def r1_velocity_to_correct_thinking_reward(
-    prompts: List[str],
-    completions: List[str],
-    answer: List[str],
-    types: Optional[List[str]] = None,
-) -> List[float]:
-    """
-    VCTR v2 - Velocity & Structural Convergence.
-
-    Combines:
-    1. Semantic Convergence: Does thinking get closer to the answer?
-    2. Structural Fingerprinting: Does the generated answer match the reference's structure?
-       (e.g., if ref has Python code, answer MUST have Python code).
-    """
-    CONVERGENCE_THRESHOLD = 0.6
-    EARLY_BONUS = 1.0
-    MIN_EXPLORATION_LINES = 3
-    ANSWER_WEIGHT = 1.0
-    CONSISTENCY_WEIGHT = 0.25
-    STRUCTURE_WEIGHT = 0.5
-
-    scores = []
-
-    for completion, ref in zip(completions, answer):
-        try:
-            thinking = _extract_thinking_lines(completion)
-            _, gen_ans = _extract_components(completion)
-
-            # --- Structural Fingerprinting ---
-            ref_fp = _analyze_structure_fingerprint(ref)
-            gen_fp = _analyze_structure_fingerprint(gen_ans)
-
-            struct_score = 1.0
-
-            # 1. Code Block Requirement
-            if ref_fp.code_blocks > 0 and gen_fp.code_blocks == 0:
-                struct_score -= 0.5  # Penalty: Missing required code
-            elif ref_fp.code_blocks == 0 and gen_fp.code_blocks > 0:
-                struct_score -= 0.2  # Penalty: Unnecessary code
-
-            # 2. Relative Position (if code exists in both)
-            if ref_fp.relative_code_pos != -1 and gen_fp.relative_code_pos != -1:
-                # If ref has code at end (0.9) and gen has it at start (0.1), penalty
-                pos_diff = abs(ref_fp.relative_code_pos - gen_fp.relative_code_pos)
-                if pos_diff > 0.5:
-                    struct_score -= 0.2
-
-            # 3. Formatting counts (softer check)
-            if abs(ref_fp.headings - gen_fp.headings) > 2:
-                struct_score -= 0.1
-
-            struct_score = max(0.0, struct_score)
-
-            # --- Semantic Velocity ---
-            consistency = _compute_consistency_score(thinking, gen_ans)
-
-            if not thinking or len(thinking) < 2:
-                # Fallback to pure answer correctness + structure
-                is_correct = gen_ans.strip().lower() == ref.strip().lower()
-                base = 0.3 if is_correct else 0.0
-                total = (
-                    base
-                    + CONSISTENCY_WEIGHT * consistency
-                    + STRUCTURE_WEIGHT * struct_score
-                ) / (1.0 + CONSISTENCY_WEIGHT + STRUCTURE_WEIGHT)
-                scores.append(min(1.0, total))
-                continue
-
-            sims = _compute_line_similarities(thinking, ref)
-            k = None
-            for i, s in enumerate(sims):
-                if s > CONVERGENCE_THRESHOLD:
-                    k = i + 1
-                    break
-
-            if k is None:
-                # Never converged, check final answer
-                is_correct = gen_ans.strip().lower() == ref.strip().lower()
-                base = 0.3 if is_correct else 0.0
-                total = (
-                    base
-                    + CONSISTENCY_WEIGHT * consistency
-                    + STRUCTURE_WEIGHT * struct_score
-                ) / (1.0 + CONSISTENCY_WEIGHT + STRUCTURE_WEIGHT)
-                scores.append(min(1.0, total))
-                continue
-
-            early = EARLY_BONUS / k
-            exploration_penalty = 0.3 if k < MIN_EXPLORATION_LINES else 0.0
-            trajectory = (sims[k - 1] - sims[0]) * 0.3 if k > 0 else 0.0
-
-            # Answer Check
-            is_correct = gen_ans.strip().lower() == ref.strip().lower()
-            answer_bonus = ANSWER_WEIGHT if is_correct else 0.0
-
-            consist_bonus = CONSISTENCY_WEIGHT * consistency
-            struct_bonus = STRUCTURE_WEIGHT * struct_score
-
-            total_raw = (
-                early
-                - exploration_penalty
-                + trajectory
-                + answer_bonus
-                + consist_bonus
-                + struct_bonus
+        scores = []
+        for i, (comp, ref) in enumerate(zip(completions, answer)):
+            phased = PhasedCompletion.from_text(
+                comp, phase_outputs[i] if i < len(phase_outputs) else None
             )
-            # Max possible approx: 1.0 + 0.3 + 1.0 + 0.25 + 0.5 = ~3.05
-            normalized = total_raw / 3.05
+            prompt = prompts[i] if prompts and i < len(prompts) else ""
+            qtype = types[i] if types and i < len(types) else None
 
-            scores.append(max(0.0, min(1.0, normalized)))
+            think_score = 0.0
+            if phased.has_thinking:
+                try:
+                    think_text = f"<think>{phased.thinking}</think>"
+                    think_score = base_reward_func(
+                        [prompt], [think_text], [ref], [qtype]
+                    )[0]
+                except Exception:
+                    think_score = 0.0
 
-        except Exception as e:
-            logger.debug(f"VCTR error: {e}")
-            scores.append(0.0)
+            try:
+                ans_score = base_reward_func([prompt], [phased.answer], [ref], [qtype])[
+                    0
+                ]
+            except Exception:
+                ans_score = 0.0
 
-    return scores
+            combined = (
+                (phase_weight_thinking * think_score + phase_weight_answer * ans_score)
+                if phased.has_thinking
+                else ans_score
+            )
+            scores.append(max(0.0, min(1.0, combined)))
+        return scores
+
+    return wrapper
 
 
 # =============================================================================
-# STANDARD REWARD FUNCTIONS
+# MAIN REWARD FUNCTIONS
 # =============================================================================
 
 
@@ -821,26 +1048,27 @@ def r1_format_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """Format Reward - Strict Mode."""
     scores = []
     MIN_CONTENT_LEN = 5
+
     for text in completions:
         if not text:
             scores.append(0.0)
             continue
-        has_open = "<think>" in text
-        has_close = "</think>" in text
-        if not has_open or not has_close:
-            scores.append(0.0)
-            continue
+
         open_pos = text.find("<think>")
         close_pos = text.find("</think>")
-        if open_pos >= close_pos:
+
+        if open_pos == -1 or close_pos == -1 or open_pos >= close_pos:
             scores.append(0.0)
             continue
+
         content_after = text[close_pos + len("</think>") :].strip()
         if len(content_after) < MIN_CONTENT_LEN:
             scores.append(0.0)
             continue
+
         scores.append(1.0)
     return scores
 
@@ -852,48 +1080,29 @@ def r1_tag_structure_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """
+    Reward for having proper XML tag structure.
+    Checks for exactly one <think> and one </think> tag, in correct order.
+    """
     scores = []
-
-    def get_length_targets(qtype: Optional[str]) -> Tuple[int, int, int]:
-        if qtype == "math":
-            return (30, 100, 400)
-        elif qtype == "code":
-            return (50, 150, 600)
-        elif qtype == "essay":
-            return (100, 200, 800)
-        else:
-            return (20, 100, 500)
-
-    for i, text in enumerate(completions):
+    for text in completions:
         if not text:
             scores.append(0.0)
             continue
+
         think_count = text.count("<think>")
-        end_count = text.count("</think>")
-        if think_count != 1 or end_count != 1:
-            scores.append(0.0)
-            continue
-        think_content, ans_content = _extract_components(text)
-        if think_content is None:
-            scores.append(0.0)
-            continue
-        think_len = len(think_content)
-        ans_len = len(ans_content)
-        qtype = types[i] if types and i < len(types) else None
-        min_len, target_min, target_max = get_length_targets(qtype)
-        if think_len < min_len:
-            length_score = 0.3
-        elif think_len < target_min:
-            ratio = (think_len - min_len) / (target_min - min_len + 1)
-            length_score = 0.5 + 0.5 * ratio
-        elif think_len <= target_max:
-            length_score = 1.0
+        end_think_count = text.count("</think>")
+
+        # Exact match required: 1 opening, 1 closing
+        if think_count == 1 and end_think_count == 1:
+            # Check order
+            if text.find("<think>") < text.find("</think>"):
+                scores.append(1.0)
+            else:
+                scores.append(0.0)  # Wrong order
         else:
-            excess_ratio = (think_len - target_max) / target_max
-            length_score = max(0.3, 1.0 - 0.3 * excess_ratio)
-        if ans_len < 10:
-            length_score *= 0.5
-        scores.append(max(0.0, min(1.0, length_score)))
+            scores.append(0.0)  # Missing or extra tags
+
     return scores
 
 
@@ -904,36 +1113,35 @@ def r1_thinking_quality_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """Thinking Quality Reward - Evaluates reasoning structure and content."""
     scores = []
-    TARGET_MIN = 15
-    TARGET_MAX = 50
-    OPTIMAL_MIN = 20
-    OPTIMAL_MAX = 40
     for text in completions:
         think, _ = _extract_components(text)
         if not think:
             scores.append(0.0)
             continue
+
         score = 1.0
         bad_count = sum(1 for p in _BAD_PHRASES_PATTERNS if p.search(think))
         if bad_count > 0:
             score -= min(0.4, 0.1 * bad_count)
+
         for token in _SPECIAL_TOKENS:
             if token in think:
                 score -= 0.3
+
         if RE_STRUCTURED_LIST.search(think):
             score += 0.1
+
         approx_tokens = len(think.split())
-        if approx_tokens < TARGET_MIN:
-            length_mult = max(0.3, approx_tokens / TARGET_MIN)
-        elif approx_tokens > TARGET_MAX:
-            excess = (approx_tokens - TARGET_MAX) / TARGET_MAX
-            length_mult = max(0.5, 1.0 - 0.2 * excess)
-        elif OPTIMAL_MIN <= approx_tokens <= OPTIMAL_MAX:
-            length_mult = 1.1
-        else:
-            length_mult = 1.0
-        score *= length_mult
+        if approx_tokens < 20:
+            score *= max(0.3, approx_tokens / 20)
+        elif approx_tokens > 80:
+            excess = (approx_tokens - 80) / 80
+            score *= max(0.5, 1.0 - 0.2 * excess)
+        elif 30 <= approx_tokens <= 60:
+            score *= 1.1
+
         scores.append(max(0.0, min(1.0, score)))
     return scores
 
@@ -945,6 +1153,7 @@ def r1_answer_quality_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """Answer Quality - Checks for unwanted content and gaming."""
     scores = []
     for text in completions:
         if not text:
@@ -954,14 +1163,18 @@ def r1_answer_quality_reward(
         if len(ans) < 5:
             scores.append(0.0)
             continue
+
         score = 1.0
         ans_lower = ans.lower()
+
+        # Check unwanted set
         ans_words = set(ans_lower.split())
         if ans_words & _UNWANTED_SET:
             matches = ans_words & _UNWANTED_SET
             if len(matches) > 1 or any(phrase in ans_lower for phrase in matches):
                 scores.append(0.0)
                 continue
+
         for phrase in _UNWANTED_SET:
             if " " in phrase and phrase in ans_lower:
                 scores.append(0.0)
@@ -971,6 +1184,7 @@ def r1_answer_quality_reward(
                 score -= 0.1
             scores.append(max(0.0, min(1.0, score)))
             continue
+
     return scores
 
 
@@ -981,63 +1195,44 @@ def r1_semantic_similarity_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """Semantic Similarity - TF-IDF with fallback."""
     scores = []
-    MIN_WORDS = 3
 
-    def compute_tfidf_similarity(text1: str, text2: str) -> Optional[float]:
+    def compute_tfidf(text1: str, text2: str) -> Optional[float]:
         if not SKLEARN_AVAILABLE:
             return None
         try:
-            c1 = _clean_text_basic(text1)
-            c2 = _clean_text_basic(text2)
-            if len(c1.split()) < MIN_WORDS or len(c2.split()) < MIN_WORDS:
+            c1, c2 = _clean_text_basic(text1), _clean_text_basic(text2)
+            if len(c1.split()) < 3 or len(c2.split()) < 3:
                 return None
-            vectorizer = TfidfVectorizer(
-                stop_words="english", min_df=1, ngram_range=(1, 2)
-            )
+            vectorizer = TfidfVectorizer(stop_words="english", min_df=1)
             tfidf = vectorizer.fit_transform([c1, c2])
             return float(cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0])
         except Exception:
             return None
 
-    def compute_ngram_similarity(text1: str, text2: str) -> float:
-        if not text1 or not text2:
-            return 0.0
-
-        def get_ngrams(t: str, n: int = 3) -> Set[str]:
-            t = t.lower()
-            return set(t[i : i + n] for i in range(len(t) - n + 1))
-
-        s1 = get_ngrams(text1)
-        s2 = get_ngrams(text2)
-        if not s1 or not s2:
-            return 0.0
-        return len(s1 & s2) / len(s1 | s2)
-
     for gen, ref in zip(completions, answer):
-        try:
-            _, gen_ans = _extract_components(gen)
-            _, ref_ans = _extract_components(ref)
-            if not gen_ans or not ref_ans:
-                scores.append(0.0)
-                continue
-            if gen_ans.strip().lower() == ref_ans.strip().lower():
-                scores.append(1.0)
-                continue
-            sim = compute_tfidf_similarity(gen_ans, ref_ans)
-            if sim is None:
-                sim = max(
-                    compute_ngram_similarity(gen_ans, ref_ans),
-                    _jaccard_similarity(gen_ans, ref_ans),
-                )
-            len_ratio = len(gen_ans) / max(len(ref_ans), 1)
-            if len_ratio > 2.0:
-                excess = len_ratio - 2.0
-                sim *= max(0.5, 1.0 - 0.1 * excess)
-            scores.append(max(0.0, min(1.0, sim)))
-        except Exception as e:
-            logger.debug(f"Semantic similarity error: {e}")
+        _, gen_ans = _extract_components(gen)
+        _, ref_ans = _extract_components(ref)
+
+        if not gen_ans or not ref_ans:
             scores.append(0.0)
+            continue
+
+        if gen_ans.strip().lower() == ref_ans.strip().lower():
+            scores.append(1.0)
+            continue
+
+        sim = compute_tfidf(gen_ans, ref_ans)
+        if sim is None:
+            sim = max(_jaccard_similarity(gen_ans, ref_ans), 0.0)
+
+        # Gentle verbosity penalty
+        len_ratio = len(gen_ans) / max(len(ref_ans), 1)
+        if len_ratio > 2.0:
+            sim *= max(0.5, 1.0 - 0.1 * (len_ratio - 2.0))
+
+        scores.append(max(0.0, min(1.0, sim)))
     return scores
 
 
@@ -1048,14 +1243,12 @@ def r1_accuracy_reward_func(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """Exact match accuracy reward."""
     scores = []
     for c, a in zip(completions, answer):
         pred = r1_extract_xml_answer(c).strip().lower()
         ref = a.strip().lower()
-        if pred == ref:
-            scores.append(1.0)
-        else:
-            scores.append(0.0)
+        scores.append(1.0 if pred == ref else 0.0)
     return scores
 
 
@@ -1066,108 +1259,211 @@ def r1_conditional_content_reward(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
-    """
-    Conditional Content Reward (The "Brain" Module).
-
-    Hierarchically evaluates:
-    - Tier 0: False identity claims (major penalty)
-    - Tier 1: Safety violations (major penalty)
-    - Tier 2: Context-aware length (adjusted by question type)
-    - Tier 3: Epistemic humility (bonus for appropriate uncertainty)
-    - Tier 4: Style quality (minor adjustments)
-    """
+    """Hierarchical Safety and Style Reward."""
     scores = []
-
     for i, text in enumerate(completions):
         if not text:
             scores.append(0.0)
             continue
-
         _, ans = _extract_components(text)
-        prompt = prompts[i] if prompts and i < len(prompts) else ""
-        qtype = types[i] if types and i < len(types) else None
-
         score = 1.0
 
-        # Tier 0: False identity (critical)
         if _check_any_pattern(_FALSE_IDENTITY_PATTERNS, text):
             score -= 0.5
-
-        # Tier 1: Safety violations (critical)
         if _check_any_pattern(_SAFETY_PATTERNS, ans):
             score -= 0.4
-
-        # Tier 2: Context-aware length
-        is_simple = _check_any_pattern(_SIMPLE_Q_PATTERNS, prompt)
-        is_sensitive = _check_any_pattern(_SENSITIVE_PATTERNS, prompt)
-        ans_words = len(ans.split())
-
-        # Get max length based on type
-        if qtype == "math":
-            max_words = 200
-        elif qtype == "code":
-            max_words = 400
-        elif qtype == "essay":
-            max_words = 800
-        elif is_simple:
-            max_words = 150
-        elif is_sensitive:
-            max_words = 300
-        else:
-            max_words = 500
-
-        if ans_words > max_words:
-            excess_ratio = (ans_words - max_words) / max_words
-            score -= min(0.2, 0.1 * excess_ratio)
-
-        # Tier 3: Epistemic humility (bonus)
         if _check_any_pattern(_HUMILITY_PATTERNS, ans):
             score += 0.1
-
-        # Tier 4: Style (minor penalty)
         if _check_any_pattern(_STYLE_BAD_PATTERNS, ans):
             score -= 0.1
 
         scores.append(max(0.0, min(1.0, score)))
+    return scores
+
+
+@register_reward_function("r1_code_execution_reward")
+def r1_code_execution_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Code Execution Reward - AST check + Safe Execution."""
+    scores = []
+
+    def safe_execute(code_str: str) -> float:
+        fname = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                f.write(code_str)
+                fname = f.name
+            result = subprocess.run(
+                [sys.executable, fname],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            return 1.0 if result.returncode == 0 else 0.0
+        except Exception:
+            return 0.0
+        finally:
+            if fname and os.path.exists(fname):
+                os.remove(fname)
+
+    for text in completions:
+        blocks = RE_CODE_PYTHON.findall(text)
+        if not blocks:
+            blocks = RE_CODE_GENERIC.findall(text)
+        if not blocks:
+            scores.append(0.5)
+            continue
+
+        full_code = "\n".join(blocks)
+        try:
+            ast.parse(full_code)
+            exec_score = safe_execute(full_code)
+            scores.append(0.3 + (0.7 * exec_score))
+        except SyntaxError:
+            scores.append(0.0)
 
     return scores
 
 
-@register_reward_function("r1_int_reward_func")
-def r1_int_reward_func(
+@register_reward_function("r1_mcq_accuracy_reward")
+def r1_mcq_accuracy_reward(
     prompts: List[str],
     completions: List[str],
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
-    return [
-        0.5 if r1_extract_xml_answer(c).strip().isdigit() else 0.0 for c in completions
-    ]
+    """MCQ Accuracy - robust extraction of A/B/C/D."""
+    scores = []
+    for gen, ref in zip(completions, answer):
+        _, gen_ans = _extract_components(gen)
+        preds = []
+        preds.extend(RE_MCQ_OPTION.findall(gen_ans))
+        preds.extend(RE_MCQ_ANSWER.findall(gen_ans))
+
+        if not preds:
+            scores.append(0.0)
+            continue
+
+        pred = preds[-1].upper()
+        ref_match = RE_MCQ_REF.search(ref)
+        ref_clean = ref_match.group(1).upper() if ref_match else ref.strip().upper()[:1]
+
+        scores.append(1.0 if pred == ref_clean else 0.0)
+    return scores
 
 
-@register_reward_function("r1_soft_format_reward_func")
-def r1_soft_format_reward_func(
+@register_reward_function("r1_anti_gaming_reward")
+def r1_anti_gaming_reward(
     prompts: List[str],
     completions: List[str],
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
-    return [
-        1.0 if "<think>" in (c or "") and "</think>" in (c or "") else 0.0
-        for c in completions
-    ]
+    """Anti-Gaming - Catch exploits like copy-pasting prompt or gibberish."""
+    scores = []
+    for i, text in enumerate(completions):
+        if not text or len(text) < 10:
+            scores.append(0.0)
+            continue
+
+        # Gibberish check
+        vowels = sum(1 for c in text.lower() if c in "aeiou")
+        if (vowels / len(text)) < 0.15:
+            scores.append(0.0)
+            continue
+
+        # Tag stuffing
+        if "<think></think>" in text:
+            scores.append(0.0)
+            continue
+
+        scores.append(1.0)
+    return scores
 
 
-@register_reward_function("r1_strict_format_reward_func")
-def r1_strict_format_reward_func(
+# =============================================================================
+# VCTR REWARDS (Velocity to Correct Thinking)
+# =============================================================================
+
+
+@register_reward_function("r1_velocity_to_correct_thinking_reward")
+def r1_velocity_to_correct_thinking_reward(
     prompts: List[str],
     completions: List[str],
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
-    return [
-        1.0 if RE_STRICT_FORMAT.search((c or "").strip()) else 0.0 for c in completions
-    ]
+    """VCTR - Measures how quickly reasoning converges to correct answer."""
+    CONVERGENCE_THRESHOLD = 0.6
+    EARLY_BONUS = 1.0
+    CONSISTENCY_WEIGHT = 0.25
+
+    scores = []
+    for completion, ref in zip(completions, answer):
+        try:
+            match = re.search(r"<think>(.*?)</think>", completion, flags=re.DOTALL)
+            thinking = (
+                [l.strip() for l in match.group(1).split("\n") if l.strip()]
+                if match
+                else []
+            )
+            _, gen_ans = _extract_components(completion)
+
+            # Consistency Score (Ratio)
+            consistency = 0.0
+            if thinking and gen_ans:
+                last_thought = thinking[-1].lower()
+                first_ans = gen_ans.split("\n")[0].strip().lower()
+                if len(first_ans) > 4:
+                    consistency = difflib.SequenceMatcher(
+                        None, last_thought, first_ans
+                    ).ratio()
+
+            if not thinking or len(thinking) < 2:
+                is_correct = gen_ans.strip().lower() == ref.strip().lower()
+                base = 0.3 if is_correct else 0.0
+                scores.append(min(1.0, base + CONSISTENCY_WEIGHT * consistency))
+                continue
+
+            sims = [_jaccard_similarity(line, ref) for line in thinking]
+            k = next(
+                (i + 1 for i, s in enumerate(sims) if s > CONVERGENCE_THRESHOLD), None
+            )
+
+            if k is None:
+                is_correct = gen_ans.strip().lower() == ref.strip().lower()
+                base = 0.3 if is_correct else 0.0
+                scores.append(min(1.0, base + CONSISTENCY_WEIGHT * consistency))
+                continue
+
+            early = EARLY_BONUS / k
+            exploration_penalty = 0.3 if k < 3 else 0.0
+            trajectory = (sims[k - 1] - sims[0]) * 0.3
+            is_correct = gen_ans.strip().lower() == ref.strip().lower()
+            answer_bonus = 1.0 if is_correct else 0.0
+
+            total = (
+                early
+                - exploration_penalty
+                + trajectory
+                + answer_bonus
+                + (CONSISTENCY_WEIGHT * consistency)
+            )
+            scores.append(max(0.0, min(1.0, total / 2.75)))
+
+        except Exception:
+            scores.append(0.0)
+    return scores
+
+
+# =============================================================================
+# RESTORED LEGACY FUNCTIONS (Fixes ImportError & CLI Errors)
+# =============================================================================
 
 
 @register_reward_function("r1_count_xml")
@@ -1177,6 +1473,10 @@ def r1_count_xml(
     answer: List[str],
     types: Optional[List[str]] = None,
 ) -> List[float]:
+    """
+    Count XML tag presence (graduated scoring).
+    Restored for compatibility with grpo_trainer.py.
+    """
     scores = []
     for text in completions:
         if not text:
@@ -1193,24 +1493,89 @@ def r1_count_xml(
     return scores
 
 
+@register_reward_function("r1_soft_format_reward_func")
+def r1_soft_format_reward_func(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Soft format check - just requires think tags present."""
+    return [
+        1.0 if "<think>" in (c or "") and "</think>" in (c or "") else 0.0
+        for c in completions
+    ]
+
+
+@register_reward_function("r1_strict_format_reward_func")
+def r1_strict_format_reward_func(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Strict format check."""
+    return [
+        1.0 if RE_STRICT_FORMAT.search((c or "").strip()) else 0.0 for c in completions
+    ]
+
+
+@register_reward_function("r1_int_reward_func")
+def r1_int_reward_func(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Check if extracted answer is an integer."""
+    return [
+        0.5 if r1_extract_xml_answer(c).strip().isdigit() else 0.0 for c in completions
+    ]
+
+
 # =============================================================================
-# MAIN
+# ADDITIONAL UTILS & TESTING
 # =============================================================================
+
+
+@register_reward_function("r1_factual_accuracy_reward")
+def r1_factual_accuracy_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None,
+) -> List[float]:
+    """Check response against specific factual constraints."""
+    scores = []
+    for text in completions:
+        if not text:
+            scores.append(0.0)
+            continue
+        score = 0.5
+        text_lower = text.lower()
+
+        if "death toll" in text_lower and any(
+            x in text_lower for x in ["100", "200-300"]
+        ):
+            score -= 0.3
+
+        scores.append(max(0.0, min(1.0, score)))
+    return scores
+
 
 if __name__ == "__main__":
-    print("GRPO Reward Functions v5.0.0")
+    print("GRPO Reward Functions v4.2.0")
     print("=" * 50)
     print(f"Registered Functions: {len(REWARD_REGISTRY)}")
-    print(f"Available: {', '.join(list_available_reward_functions())}")
 
-    # Simple test for VCTR structure logic
-    print("\nTesting VCTR Structure Match:")
-    ref = "Here is the code:\n```python\nprint('hello')\n```"
-    comp_good = "<think>...</think>Answer:\n```python\nprint('hi')\n```"
-    comp_bad = "<think>...</think>The answer is print('hi')"
+    # Simple Test
+    prompts = ["What is 2+2?"]
+    comps = ["<think>2+2 is 4</think>4"]
+    ans = ["4"]
 
-    score_good = r1_velocity_to_correct_thinking_reward([""], [comp_good], [ref])[0]
-    score_bad = r1_velocity_to_correct_thinking_reward([""], [comp_bad], [ref])[0]
-
-    print(f"  Ref with code, Comp with code: {score_good:.3f}")
-    print(f"  Ref with code, Comp no code:   {score_bad:.3f}")
+    for name, func in REWARD_REGISTRY.items():
+        try:
+            s = func(prompts, comps, ans, ["math"])
+            print(f"✅ {name}: {s[0]:.3f}")
+        except Exception as e:
+            print(f"❌ {name}: {e}")

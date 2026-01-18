@@ -134,8 +134,8 @@ FEWSHOT_IDENTITY_TURNS = [
 class IdentityConfig:
     """Configuration for identity injection."""
 
-    enabled: bool = False
-    injection_probability: float = 0.85
+    enabled: bool = True
+    injection_probability: float = 0.15
     filter_unwanted_words: bool = True
     identity_samples_path: Optional[str] = None
 
@@ -144,8 +144,8 @@ class IdentityConfig:
 class CrossSampleConfig:
     """Configuration for Cross Sampling (Fake History)."""
 
-    enabled: bool = False
-    probability: float = 0.5
+    enabled: bool = True
+    probability: float = 0.2
     max_history_tokens: int = 512
 
 
@@ -153,8 +153,8 @@ class CrossSampleConfig:
 class SystemPromptConfig:
     """Configuration for system prompt strategy."""
 
-    use_system_prompts: bool = False
-    system_prompt_probability: float = 0.2  # 20% system prompt, 80% few-shot
+    use_system_prompts: bool = True
+    system_prompt_probability: float = 0.1  # 20% system prompt, 80% few-shot
     use_short_when_augmented: bool = (
         True  # Use short prompt when identity/cross-sample active
     )
@@ -1761,7 +1761,11 @@ def create_dataset(data, tokenizer: PreTrainedTokenizer, config):
     enable_cross_sampling = getattr(config, "enable_cross_sampling", True)
     enable_word_filtering = getattr(config, "enable_word_filtering", True)
     enable_logging = getattr(config, "enable_dataset_logging", True)
-    identity_samples_path = getattr(config, "identity_samples_path", None)
+    identity_samples_path = getattr(
+        config,
+        "identity_samples_path",
+        "/Users/adeelahmad/work/SiLLM-examples/helpsteer/mlx-grpo/identity23o.jsonl_filtered.jsonl",
+    )
 
     log_path = getattr(config, "dataset_log_path", None)
     if log_path is None and hasattr(config, "adapter_path"):
@@ -1777,13 +1781,13 @@ def create_dataset(data, tokenizer: PreTrainedTokenizer, config):
 
     cross_sample_config = CrossSampleConfig(
         enabled=enable_cross_sampling,
-        probability=getattr(config, "cross_sample_probability", 0.5),
+        probability=getattr(config, "cross_sample_probability", 0.2),
         max_history_tokens=getattr(config, "cross_sample_max_tokens", 512),
     )
 
     system_prompt_config = SystemPromptConfig(
         use_system_prompts=getattr(config, "use_system_prompts", True),
-        system_prompt_probability=getattr(config, "system_prompt_probability", 0.2),
+        system_prompt_probability=getattr(config, "system_prompt_probability", 0.1),
         use_short_when_augmented=getattr(
             config, "use_short_system_prompt_when_augmented", True
         ),
@@ -1950,8 +1954,8 @@ def get_cache_path(data_path: Path, split_name: str, config) -> Path:
         f"{getattr(config, 'enable_identity_injection', True)}_"
         f"{getattr(config, 'enable_cross_sampling', True)}_"
         f"{getattr(config, 'enable_word_filtering', True)}_"
-        f"{getattr(config, 'identity_injection_probability', 0.85)}_"
-        f"{getattr(config, 'cross_sample_probability', 0.5)}"
+        f"{getattr(config, 'identity_injection_probability', 0.15)}_"
+        f"{getattr(config, 'cross_sample_probability', 0.2)}"
     )
 
     config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
@@ -2157,10 +2161,14 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
         ds["enable_cross_sampling"] = getattr(args, "enable_cross_sampling", True)
         ds["enable_word_filtering"] = getattr(args, "enable_word_filtering", True)
         ds["enable_dataset_logging"] = getattr(args, "enable_dataset_logging", True)
-        ds["identity_samples_path"] = getattr(args, "identity_samples_path", None)
+        ds["identity_samples_path"] = getattr(
+            args,
+            "identity_samples_path",
+            "/Users/adeelahmad/work/SiLLM-examples/helpsteer/mlx-grpo/identity23o.jsonl_filtered.jsonl",
+        )
         ds["use_system_prompts"] = getattr(args, "use_system_prompts", True)
         ds["system_prompt_probability"] = getattr(
-            args, "system_prompt_probability", 0.2
+            args, "system_prompt_probability", 0.1
         )
 
         config = types.SimpleNamespace(**ds)

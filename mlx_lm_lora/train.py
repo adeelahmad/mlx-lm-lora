@@ -327,7 +327,7 @@ def build_parser():
         choices=["adam", "adamw", "qhadam", "muon"],
         default="adamw",
     )
-    parser.add_argument("--mask-prompt", action="store_true", default=False)
+    parser.add_argument("--mask-prompt", action="store_true", default=True)
     parser.add_argument("--num-layers", type=int, help="Layers to fine-tune.")
     parser.add_argument("--batch-size", type=int, help="Minibatch size.")
     parser.add_argument("--iters", type=int, help="Iterations.")
@@ -346,14 +346,14 @@ def build_parser():
     parser.add_argument("--max-completion-length", type=int, default=128)
 
     parser.add_argument("-c", "--config", type=str, help="YAML config.")
-    parser.add_argument("--grad-checkpoint", action="store_true", default=True)
+    parser.add_argument("--grad-checkpoint", action="store_true", default=False)
     parser.add_argument("--wandb", type=str, default=None)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--fuse", action="store_true", default=None)
 
     # LoRA
-    parser.add_argument("--lora-rank", type=int, default=64)
-    parser.add_argument("--lora-alpha", type=int, default=128)
+    parser.add_argument("--lora-rank", type=int, default=128)
+    parser.add_argument("--lora-alpha", type=int, default=256)
     parser.add_argument("--lora-dropout", type=float, default=0.00)
     parser.add_argument("--lora-scale", type=float, default=2)
 
