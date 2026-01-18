@@ -993,10 +993,10 @@ def r1_thinking_quality_reward(
     scores = []
 
     # Length targets (in approximate tokens/words)
-    TARGET_MIN = 30
-    TARGET_MAX = 100
-    OPTIMAL_MIN = 40
-    OPTIMAL_MAX = 80
+    TARGET_MIN = 20
+    TARGET_MAX = 80
+    OPTIMAL_MIN = 30
+    OPTIMAL_MAX = 60
 
     for text in completions:
         think, _ = _extract_components(text)
@@ -1880,6 +1880,83 @@ def r1_velocity_to_correct_thinking_reward(
             logger.debug(f"VCTR error: {e}")
             scores.append(0.0)
 
+    return scores
+
+
+
+
+
+@register_reward_function("r1_factual_accuracy_rewardv2")
+def r1_factual_accuracy_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None
+) -> List[float]:
+    """
+    Check response against known facts database.
+    Matches standard signature and returns normalized [0, 1] scores.
+    """
+    scores = []
+    for text in completions:
+        if not text:
+            scores.append(0.0)
+            continue
+
+        # Start at neutral (0.5)
+        score = 0.5
+        text_lower = text.lower()
+
+        # Critical fact checks
+        if "tank man" in text_lower:
+            if any(x in text_lower for x in ["was shot", "was hit", "was killed", "was run over"]):
+                score -= 0.5  # Heavy penalty
+            elif "blocked" in text_lower or "stopped" in text_lower:
+                score += 0.2  # Reward correct framing
+
+        if "death toll" in text_lower:
+            # Check for low estimates vs credible ranges
+            if any(x in text_lower for x in ["100", "200-300"]):
+                score -= 0.3
+            elif any(x in text_lower for x in ["2000", "3000", "2,000"]):
+                score += 0.2
+
+        scores.append(max(0.0, min(1.0, score)))
+    return scores
+
+
+@register_reward_function("r1_anti_hallucination_reward")
+def r1_anti_hallucination_reward(
+    prompts: List[str],
+    completions: List[str],
+    answer: List[str],
+    types: Optional[List[str]] = None
+) -> List[float]:
+    """
+    Penalize fabricated details.
+    Matches standard signature and returns normalized [0, 1] scores.
+    """
+    scores = []
+    hallucination_patterns = [
+        "holding a sign",
+        "i remember seeing",
+        "the sign says",
+        "i found a photo online",
+    ]
+
+    for text in completions:
+        if not text:
+            scores.append(0.0)
+            continue
+
+        score = 1.0
+        text_lower = text.lower()
+
+        for pattern in hallucination_patterns:
+            if pattern in text_lower:
+                score -= 0.25
+
+        scores.append(max(0.0, min(1.0, score)))
     return scores
 
 

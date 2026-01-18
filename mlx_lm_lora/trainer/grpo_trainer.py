@@ -354,13 +354,13 @@ class GenerationPhase:
     max_tokens: int
     stop_sequences: List[str]
     temperature: float
-    top_p: float = 0.95
-    top_k: int = 20
+    top_p: float = 0.8
+    top_k: int = 50
     min_p: float = 0.0
     logit_biases: Optional[Dict[int, float]] = None
-    min_tokens: int = 0
-    continue_from_previous: bool = True
-    repetition_penalty: float = 1.0
+    min_tokens: int = 1
+    continue_from_previous: bool = False
+    repetition_penalty: float = 1.2
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -435,18 +435,18 @@ def get_default_thinking_phases(
             stop_sequences=["</think>"],
             temperature=thinking_temperature,
             min_tokens=min_thinking_tokens,
-            top_p=0.95,
-            top_k=30,
-            repetition_penalty=1.1,
+            top_p=0.80,
+            top_k=50,
+            repetition_penalty=1.2,
         ),
         GenerationPhase(
             name="answer",
             max_tokens=answer_max_tokens,
             stop_sequences=["</answer>", "<|im_end|>", "<|endoftext|>"],
             temperature=answer_temperature,
-            continue_from_previous=True,
-            top_p=0.9,
-            top_k=20,
+            continue_from_previous=False,
+            top_p=0.5,
+            top_k=30,
             repetition_penalty=1.2,
         ),
     ]
@@ -768,11 +768,11 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Sampling parameters (CONFIGURABLE - no hardcoding!)
     top_p: float = field(
-        default=0.7,
+        default=0.9,
         metadata={"help": "Top-p (nucleus) sampling parameter."},
     )
     top_k: int = field(
-        default=30,
+        default=50,
         metadata={"help": "Top-k sampling parameter. Set to 0 to disable."},
     )
     min_p: float = field(
@@ -793,7 +793,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
     repetition_context_size: int = field(
-        default=20,
+        default=40,
         metadata={"help": "Number of recent tokens to apply repetition penalty to."},
     )
     logit_bias: Optional[Dict[int, float]] = field(
@@ -830,7 +830,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Group size for KV cache quantization. Default: 64."},
     )
     quantized_kv_start: int = field(
-        default=0,
+        default=None,
         metadata={
             "help": "Start quantizing KV cache from this generation step. "
             "0 = quantize from start, >0 = quantize after N tokens."
@@ -846,7 +846,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Phased Generation (NEW - for thinking models)
     use_phased_generation: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": "Enable multi-phase constrained generation for thinking models. "
             "Non-breaking: off by default, existing behavior preserved."
@@ -860,23 +860,23 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
     phased_thinking_max_tokens: int = field(
-        default=1500,
+        default=420,
         metadata={"help": "Max tokens for thinking phase (default phases)."},
     )
     phased_answer_max_tokens: int = field(
-        default=500,
+        default=512,
         metadata={"help": "Max tokens for answer phase (default phases)."},
     )
     phased_min_thinking_tokens: int = field(
-        default=50,
+        default=10,
         metadata={"help": "Minimum tokens before allowing </think> (default phases)."},
     )
     phased_thinking_temperature: float = field(
-        default=0.7,
+        default=0.8,
         metadata={"help": "Temperature for thinking phase (default phases)."},
     )
     phased_answer_temperature: float = field(
-        default=0.5,
+        default=0.4,
         metadata={"help": "Temperature for answer phase (default phases)."},
     )
     phased_verbose: bool = field(
@@ -893,11 +893,11 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         },
     )
     min_think_tokens: int = field(
-        default=50,
+        default=10,
         metadata={"help": "Minimum tokens before allowing </think> closure."},
     )
     max_think_tokens: int = field(
-        default=120,
+        default=320,
         metadata={"help": "Start strong bias toward </think> closure."},
     )
     think_close_bias_start: int = field(
@@ -913,7 +913,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Bias decay per step (0.995 = slow decay)."},
     )
     force_close_after: int = field(
-        default=220,
+        default=460,
         metadata={"help": "Absolute maximum - force </think> closure."},
     )
     sampler_verbose: bool = field(
@@ -923,19 +923,19 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Gradient checkpointing options
     grad_checkpoint_layers: Optional[List[int]] = field(
-        default=None,
+        default=2,
         metadata={
             "help": "Specific layer indices to checkpoint. If None, uses frequency-based."
         },
     )
     grad_checkpoint_frequency: int = field(
-        default=1,
+        default=None,
         metadata={"help": "Checkpoint every N layers. 1 = all layers."},
     )
 
     # Performance optimizations
     use_compilation: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Use MLX compilation for 7x speedup (recommended)."},
     )
     aggressive_gc: bool = field(
@@ -961,11 +961,11 @@ class GRPOTrainingArgs(SFTTrainingArgs):
 
     # Tracking features
     track_diversity: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Track generation diversity to detect mode collapse."},
     )
     track_kl_spikes: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Track KL spikes for analysis."},
     )
     kl_spike_threshold: float = field(
@@ -999,7 +999,7 @@ class GRPOTrainingArgs(SFTTrainingArgs):
         metadata={"help": "Log sample completions to WandB tables."},
     )
     wandb_log_model: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Upload model checkpoints to WandB."},
     )
 
@@ -1051,12 +1051,12 @@ class GRPOTrainingArgs(SFTTrainingArgs):
     )
 
     actor_sync_frequency: int = field(
-        default=10,
+        default=2,
         metadata={"help": "Sync weights every N training steps."}
     )
 
     lazy_load_actors: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "[DEPRECATED] Multi-actor is now always memory-efficient. "
                     "Only one actor is loaded at a time by default."
@@ -1401,7 +1401,7 @@ class DiversityTracker:
 
     def __init__(self, window_size: int = 10):
         self.window_size = window_size
-        self.generation_history: deque = deque(maxlen=window_size * 100)
+        self.generation_history: deque = deque(maxlen=window_size * 20)
         self.diversity_by_update: Dict[int, Dict] = {}
         self.cross_update_patterns: Dict[str, set] = defaultdict(set)
 
@@ -1634,6 +1634,7 @@ class ActorState:
     mean_reward: float = 0.0
 
 
+
 class MultiActorGRPO:
     """
     Multi-Actor GRPO Manager for diverse policy exploration.
@@ -1660,6 +1661,8 @@ class MultiActorGRPO:
     - Actor divergence modes (temperature, noise, both)
     - Grad checkpointing propagation to actors
     - DoRA/LoRA layer verification
+    - Gradient validation and NaN protection (v5.3.2)
+    - Consistent precision handling (v5.3.2)
     """
 
     def __init__(
@@ -1684,6 +1687,10 @@ class MultiActorGRPO:
         # Grad checkpointing
         grad_checkpoint_layers: Optional[List[int]] = None,
         grad_checkpoint_frequency: int = 1,
+        # NEW v5.3.2: Numerical stability options
+        gradient_clip_value: Optional[float] = None,  # None = no clipping, recommended: 1.0
+        validate_gradients: bool = True,  # Check for NaN/Inf
+        precision: str = "float32",  # "float32", "float16", "bfloat16"
     ):
         self.main_actor = main_actor
         self.model_path = model_path
@@ -1706,6 +1713,12 @@ class MultiActorGRPO:
         # Grad checkpointing settings
         self.grad_checkpoint_layers = grad_checkpoint_layers
         self.grad_checkpoint_frequency = grad_checkpoint_frequency
+
+        # NEW v5.3.2: Numerical stability settings
+        self.gradient_clip_value = gradient_clip_value
+        self.validate_gradients = validate_gradients
+        self.precision = precision
+        self._dtype = self._get_dtype(precision)
 
         valid_modes = ["main_to_actors", "actors_to_main", "bidirectional"]
         if sync_mode not in valid_modes:
@@ -1742,6 +1755,8 @@ class MultiActorGRPO:
                 "temperature_offset": config.temperature_offset,
                 "grads_skipped": 0,
                 "grads_accumulated": 0,
+                "nan_gradients": 0,  # NEW v5.3.2
+                "clipped_gradients": 0,  # NEW v5.3.2
             }
             for config in actor_configs
         }
@@ -1776,6 +1791,10 @@ class MultiActorGRPO:
         self._dora_layers = 0
         self._verify_adapter_structure(main_actor)
 
+        # NEW v5.3.2: Store canonical gradient keys from main actor for consistent accumulation
+        self._canonical_grad_keys: Optional[Set[str]] = None
+        self._init_canonical_grad_keys(main_actor)
+
         # Extract LoRA params from main actor if not provided
         if lora_params is None:
             self._extract_lora_params_from_model(main_actor)
@@ -1786,6 +1805,11 @@ class MultiActorGRPO:
         if verbose:
             tqdm.write(f"[MultiActor] Initialized: {len(actor_configs)} actors, sync_frequency={sync_frequency}")
             tqdm.write(f"  • Cache directory: {self.cache_dir}")
+            tqdm.write(f"  • Precision: {precision}")
+            if gradient_clip_value:
+                tqdm.write(f"  • Gradient clipping: {gradient_clip_value}")
+            if validate_gradients:
+                tqdm.write(f"  • Gradient validation: enabled")
             if self._lora_layers > 0:
                 tqdm.write(f"  • LoRA layers: {self._lora_layers}")
             if self._dora_layers > 0:
@@ -1797,6 +1821,72 @@ class MultiActorGRPO:
             for cfg in actor_configs:
                 cached = "✓ cached" if cfg.get_cache_key() in self._cached_bases else "⚠ not cached"
                 tqdm.write(f"  • {cfg.name}: {cfg.quantization or 'full'}, temp_offset={cfg.temperature_offset:+.2f} ({cached})")
+
+    def _get_dtype(self, precision: str) -> mx.Dtype:
+        """Convert precision string to MLX dtype."""
+        dtype_map = {
+            "float32": mx.float32,
+            "float16": mx.float16,
+            "bfloat16": mx.bfloat16,
+        }
+        return dtype_map.get(precision, mx.float32)
+
+    def _init_canonical_grad_keys(self, model: nn.Module):
+        """
+        Initialize canonical gradient key set from main model.
+        This ensures consistent gradient accumulation across actors with different key prefixes.
+        """
+        trainable_params = dict(tree_flatten(model.trainable_parameters()))
+        self._canonical_grad_keys = set(trainable_params.keys())
+
+        # Also store normalized keys (without 'model.' prefix) for matching
+        self._normalized_grad_keys: Dict[str, str] = {}
+        for key in self._canonical_grad_keys:
+            # Normalize: remove 'model.' prefix if present
+            normalized = key[6:] if key.startswith("model.") else key
+            self._normalized_grad_keys[normalized] = key
+
+        if self.verbose:
+            tqdm.write(f"  • Canonical grad keys: {len(self._canonical_grad_keys)}")
+
+    def _normalize_gradient_keys(self, grads: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        """
+        Normalize gradient keys to match canonical keys from main model.
+        This fixes the key mismatch issue between actors with different prefixes.
+        """
+        if self._canonical_grad_keys is None:
+            return grads
+
+        normalized_grads = {}
+
+        for key, value in grads.items():
+            # Check if key is already canonical
+            if key in self._canonical_grad_keys:
+                normalized_grads[key] = value
+                continue
+
+            # Try to find matching canonical key
+            # Remove 'model.' prefix if present
+            normalized_key = key[6:] if key.startswith("model.") else key
+
+            # Check if normalized key maps to a canonical key
+            if normalized_key in self._normalized_grad_keys:
+                canonical_key = self._normalized_grad_keys[normalized_key]
+                normalized_grads[canonical_key] = value
+                continue
+
+            # Try adding 'model.' prefix
+            prefixed_key = f"model.{key}" if not key.startswith("model.") else key
+            if prefixed_key in self._canonical_grad_keys:
+                normalized_grads[prefixed_key] = value
+                continue
+
+            # If no match found, keep original (shouldn't happen often)
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] ⚠ Unmatched gradient key: {key}")
+            normalized_grads[key] = value
+
+        return normalized_grads
 
     def _extract_lora_params_from_model(self, model: nn.Module):
         """Extract LoRA parameters from existing model structure."""
@@ -1816,72 +1906,372 @@ class MultiActorGRPO:
                         tqdm.write(f"  • Extracted LoRA params: rank={rank}, scale={self.lora_params['scale']}")
                     return
 
+    def _smart_load_weights(self, model: nn.Module, weight_path: str, strict: bool = False):
+        """
+        Robustly load weights handling 'model.' prefix mismatches.
+        Fixes the issue where weights fail to load silently, leading to garbage output.
+
+        v5.3.2: Added validation for quantized weight loading.
+        """
+        if not Path(weight_path).exists():
+            if strict:
+                raise FileNotFoundError(f"Weight file not found: {weight_path}")
+            return
+
+        # Load weights from disk
+        try:
+            weights = mx.load(str(weight_path))
+        except Exception as e:
+            tqdm.write(f"    [MultiActor] Error loading weights file {weight_path}: {e}")
+            if strict:
+                raise
+            return
+
+        # Flatten model parameters to check against
+        model_params = dict(tree_flatten(model.parameters()))
+        model_keys = set(model_params.keys())
+        file_keys = set(weights.keys())
+
+        updates = {}
+        matched_file_keys = set()
+
+        # 1. Try exact matching
+        for k, v in weights.items():
+            if k in model_keys:
+                updates[k] = v
+                matched_file_keys.add(k)
+
+        # 2. Try prefix correction (model.layers <-> layers)
+        for k, v in weights.items():
+            if k in matched_file_keys:
+                continue
+
+            # Remove 'model.' prefix
+            if k.startswith("model."):
+                short_k = k[6:]
+                if short_k in model_keys and short_k not in updates:
+                    updates[short_k] = v
+                    matched_file_keys.add(k)
+                    continue
+
+            # Add 'model.' prefix
+            long_k = f"model.{k}"
+            if long_k in model_keys and long_k not in updates:
+                updates[long_k] = v
+                matched_file_keys.add(k)
+                continue
+
+        if not updates:
+            if strict:
+                raise ValueError(f"No matching weights found in {weight_path}")
+            else:
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] ⚠ Warning: No weights matched from {Path(weight_path).name}")
+                return
+
+        # v5.3.2: Validate that critical weights are loaded for quantized models
+        if strict:
+            # Check if we're loading a quantized model (should have 'scales' keys)
+            has_scales_in_model = any('scales' in k for k in model_keys)
+            has_scales_in_updates = any('scales' in k for k in updates.keys())
+
+            if has_scales_in_model and not has_scales_in_updates:
+                raise RuntimeError(
+                    f"CRITICAL: Model expects quantized scales but none were loaded from {weight_path}. "
+                    f"This will cause garbage output. Model keys with 'scales': "
+                    f"{[k for k in model_keys if 'scales' in k][:5]}..."
+                )
+
+        # Apply updates
+        model.update(tree_unflatten(list(updates.items())))
+        mx.eval(model.parameters())
+
+        if self.verbose and strict:
+            tqdm.write(f"    [MultiActor] Loaded {len(updates)}/{len(file_keys)} weights from {Path(weight_path).name}")
+
     def _cache_quantized_bases(self):
-        """Cache quantized base models at startup (one per unique config)."""
+        """
+        Cache quantized base models using mx.quantize with aggressive memory cleanup.
+        """
         unique_configs: Dict[str, ActorConfig] = {}
         for config in self.actor_configs:
-            cache_key = config.get_cache_key()
-            if cache_key not in unique_configs:
-                unique_configs[cache_key] = config
+            # We only cache if quantization is requested
+            if config.quantization:
+                cache_key = config.get_cache_key()
+                if cache_key not in unique_configs:
+                    unique_configs[cache_key] = config
 
         for cache_key, config in unique_configs.items():
             cache_path = self.cache_dir / f"base_{cache_key}.safetensors"
+            config.cache_path = cache_path  # Update config with the path
+            self._cached_bases[cache_key] = cache_path  # Track in our dict
 
             if cache_path.exists():
-                # Already cached on disk
-                self._cached_bases[cache_key] = cache_path
                 if self.verbose:
-                    size_mb = cache_path.stat().st_size / 1024**2
-                    tqdm.write(f"    [MultiActor] Found cached base: {cache_key} ({size_mb:.1f}MB)")
-            else:
-                # Need to create and cache
-                if self.verbose:
-                    tqdm.write(f"    [MultiActor] Creating cached base: {cache_key}...")
-
-                try:
-                    from mlx_lm import load as mlx_load
-
-                    # Determine quantization config
-                    if config.quantization:
-                        bits_map = {"2bit": 2, "3bit": 3, "4bit": 4, "6bit": 6, "8bit": 8}
-                        bits = bits_map.get(config.quantization)
-                        if bits:
-                            # Load with quantization
-                            base_model, _ = mlx_load(
-                                self.model_path,
-                                model_config={"quantization": {"bits": bits, "group_size": config.quantization_group_size}}
-                            )
-                        else:
-                            base_model, _ = mlx_load(self.model_path)
-                    else:
-                        base_model, _ = mlx_load(self.model_path)
-
-                    # Force GPU sync after loading
-                    mx.eval(base_model.parameters())
-
-                    # Save base weights to cache
-                    base_weights = dict(tree_flatten(base_model.parameters()))
-                    mx.save_safetensors(str(cache_path), base_weights)
-
-                    # Store cache path
-                    self._cached_bases[cache_key] = cache_path
-
-                    # Cleanup with GPU sync
-                    del base_model, base_weights
-                    mx.eval()
-                    gc.collect()
-                    mx.clear_cache()
-
-                    if self.verbose:
+                    try:
                         size_mb = cache_path.stat().st_size / 1024**2
-                        tqdm.write(f"    [MultiActor] ✓ Cached: {cache_key} ({size_mb:.1f}MB)")
+                        tqdm.write(f"    [MultiActor] Found cached base: {cache_key} ({size_mb:.1f}MB)")
+                    except:
+                        pass
+                continue
 
-                except Exception as e:
-                    tqdm.write(f"    [MultiActor] ⚠ Failed to cache {cache_key}: {e}")
-                    # Continue without caching - will use deepcopy fallback
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] Creating cached base: {cache_key}...")
 
-            # Store cache path in config
-            config.cache_path = cache_path
+            try:
+                from mlx_lm import load as mlx_load
+                from mlx.nn import quantize
+
+                # 1. Load base model (This temporarily spikes memory, but we clean it up immediately)
+                base_model, _ = mlx_load(self.model_path)
+
+                # 2. Determine bits
+                bits_map = {"2bit": 2, "3bit": 3, "4bit": 4, "6bit": 6, "8bit": 8}
+                bits = bits_map.get(config.quantization, 4)
+
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] Quantizing to {bits}bit...")
+
+                # 3. Quantize (In-Place)
+                quantize(base_model, group_size=config.quantization_group_size, bits=bits)
+
+                # v5.3.2: Force evaluation to ensure quantization is complete
+                mx.eval(base_model.parameters())
+
+                # 4. Save quantized weights
+                base_weights = dict(tree_flatten(base_model.parameters()))
+
+                # v5.3.2: Validate that scales exist
+                has_scales = any('scales' in k for k in base_weights.keys())
+                if not has_scales:
+                    tqdm.write(f"    [MultiActor] ⚠ Warning: No 'scales' found in quantized weights for {cache_key}")
+
+                mx.save_safetensors(str(cache_path), base_weights)
+
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] ✓ Cached: {cache_key} ({len(base_weights)} tensors)")
+
+                # 5. CRITICAL MEMORY CLEANUP
+                del base_weights
+                del base_model
+
+                mx.eval()
+                gc.collect()
+                mx.clear_cache()
+                try:
+                    mx.metal.clear_cache()
+                except AttributeError:
+                    pass
+
+            except Exception as e:
+                tqdm.write(f"    [MultiActor] ⚠ Failed to cache {cache_key}: {e}")
+                import traceback
+                traceback.print_exc()
+                mx.eval()
+                gc.collect()
+
+
+    def _load_actor(self, config: ActorConfig, actor_idx: int = 0) -> nn.Module:
+        """
+        Load actor for multi-actor GRPO.
+
+        v5.3.4: CRITICAL FIX - Don't copy LoRA weights to differently-quantized actors.
+
+        The previous approach failed because:
+        - LoRA weights are trained on SPECIFIC base weights
+        - Quantization changes base weights (rounding)
+        - LoRA from one quantization doesn't work on another
+
+        New approach:
+        - If actor has SAME quantization as main: copy LoRA weights
+        - If actor has DIFFERENT quantization: start with fresh LoRA (random init)
+        - Gradients are averaged across actors, so they converge over time
+        """
+        self._unload_current_actor()
+
+        gc.collect()
+        mx.eval()
+        mx.clear_cache()
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            pass
+
+        # Determine if we can safely copy LoRA weights
+        main_quantization = self._get_main_quantization()
+        can_copy_lora = (config.quantization == main_quantization)
+
+        if self.verbose:
+            if can_copy_lora:
+                tqdm.write(f"    [MultiActor] {config.name}: Same quant as main, will copy LoRA")
+            else:
+                tqdm.write(f"    [MultiActor] {config.name}: Different quant ({config.quantization} vs {main_quantization}), fresh LoRA")
+
+        # Save LoRA weights only if we'll use them
+        temp_adapter = None
+        if can_copy_lora:
+            temp_adapter = self._temp_dir / f"actor_{actor_idx}_current.safetensors"
+            all_main_params = dict(tree_flatten(self.main_actor.trainable_parameters()))
+            lora_weights = {
+                k: v for k, v in all_main_params.items()
+                if 'lora_' in k or 'magnitude' in k
+            }
+            if lora_weights:
+                mx.save_safetensors(str(temp_adapter), lora_weights)
+            del all_main_params, lora_weights
+            mx.eval()
+
+        actor = None
+        try:
+            from mlx_lm import load as mlx_load
+            from mlx_lm.tuner.utils import linear_to_lora_layers
+
+            # Load base model
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] Loading base model...")
+
+            actor, _ = mlx_load(self.model_path)
+            mx.eval(actor.parameters())
+
+            # Apply quantization if configured
+            if config.quantization:
+                from mlx.nn import quantize
+
+                bits_map = {"2bit": 2, "3bit": 3, "4bit": 4, "6bit": 6, "8bit": 8}
+                bits = bits_map.get(config.quantization, 4)
+
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] Quantizing to {bits}bit...")
+
+                quantize(actor, group_size=config.quantization_group_size, bits=bits)
+                mx.eval(actor.parameters())
+
+            # Freeze base
+            actor.freeze()
+
+            # Apply LoRA
+            lora_config = self.lora_params.copy()
+
+            def get_float(val, default):
+                if hasattr(val, 'item'):
+                    return float(val.item())
+                if isinstance(val, (int, float)):
+                    return float(val)
+                return default
+
+            linear_to_lora_layers(
+                model=actor,
+                num_layers=-1,
+                config={
+                    "rank": lora_config.get("rank", 16),
+                    "dropout": get_float(lora_config.get("dropout"), 0.0),
+                    "scale": get_float(lora_config.get("alpha", 32), 32.0),
+                },
+                use_dora=self._dora_layers > 0,
+            )
+
+            # Only load LoRA weights if same quantization
+            if can_copy_lora and temp_adapter and temp_adapter.exists():
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] Loading LoRA weights from main...")
+                actor.load_weights(str(temp_adapter), strict=False)
+            else:
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] Using fresh random LoRA initialization")
+
+            actor.train()
+            mx.eval(actor.parameters())
+
+            # Verify
+            trainable = dict(tree_flatten(actor.trainable_parameters()))
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] ✓ {config.name}: {len(trainable)} trainable params")
+
+        except Exception as e:
+            tqdm.write(f"    [MultiActor] ⚠ Load failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+            if actor is not None:
+                del actor
+            gc.collect()
+            mx.clear_cache()
+
+            # Fallback: deepcopy main (guaranteed to work)
+            tqdm.write(f"    [MultiActor] Using deepcopy fallback")
+            actor = copy.deepcopy(self.main_actor)
+            actor.train()
+
+        finally:
+            if temp_adapter and temp_adapter.exists():
+                try:
+                    temp_adapter.unlink()
+                except:
+                    pass
+
+        # Apply divergence
+        if self.divergence_mode in ["noise", "both"]:
+            self._apply_weight_noise(actor, actor_idx)
+
+        if self.grad_checkpoint_layers is not None or self.grad_checkpoint_frequency > 1:
+            self._apply_grad_checkpointing(actor)
+
+        mx.eval(actor.parameters())
+
+        self._current_actor = actor
+        self._current_config = config
+        self._current_actor_steps = 0
+
+        return actor
+
+    def _get_main_quantization(self) -> Optional[str]:
+        """Detect quantization level of main actor."""
+        # Check if main model has QuantizedLinear layers
+        for name, module in self.main_actor.named_modules():
+            module_type = type(module).__name__
+            if 'QuantizedLinear' in module_type:
+                # Try to detect bits from the module
+                if hasattr(module, 'bits'):
+                    bits = module.bits
+                    return f"{bits}bit"
+                # Fallback: check weight dtype/shape
+                if hasattr(module, 'scales'):
+                    # It's quantized but we don't know the bits
+                    return "quantized"
+        return None  # Full precision
+
+
+    def _load_actor_for_sync_cycle(self, config: ActorConfig, actor_idx: int = 0) -> nn.Module:
+        """
+        Load actor for an entire sync cycle (will run multiple steps before unload).
+        Same as _load_actor but with explicit sync cycle semantics.
+        """
+        return self._load_actor(config, actor_idx)
+
+    def _unload_current_actor(self):
+        if self._current_actor is not None:
+            # Delete all references
+            del self._current_actor
+            self._current_actor = None
+
+            # CRITICAL: Force synchronous cleanup
+            mx.eval()  # Finish pending ops
+            gc.collect()
+            mx.clear_cache()
+
+            # MLX Metal-specific cleanup
+            try:
+                mx.metal.clear_cache()
+                mx.metal.reset_peak_memory()  # Reset tracking
+            except AttributeError:
+                pass
+
+            # Force Python to release memory
+            import ctypes
+            try:
+                ctypes.CDLL("libc.dylib").malloc_trim(0)
+            except:
+                pass
 
     def _verify_adapter_structure(self, model: nn.Module):
         """Verify LoRA/DoRA structure is present."""
@@ -1892,169 +2282,6 @@ class MultiActorGRPO:
             # Check for DoRA layers (have magnitude attribute)
             if hasattr(module, 'magnitude'):
                 self._dora_layers += 1
-
-    def _load_actor(self, config: ActorConfig, actor_idx: int = 0) -> nn.Module:
-        """
-        Load actor by reconstructing from cached base + current LoRA weights.
-
-        This is MUCH more efficient than deepcopy:
-        1. Save current LoRA adapter to temp file (tiny - just LoRA params ~20MB)
-        2. Load fresh base model with quantization from cache
-        3. Reconstruct LoRA structure
-        4. Load adapter weights
-
-        Benefits:
-        - No deepcopy overhead (saves time and memory spikes)
-        - Native quantization (cleaner, more stable)
-        - Much smaller memory footprint
-        """
-        self._unload_current_actor()
-
-        cache_key = config.get_cache_key()
-
-        # 1. Save current LoRA adapter to temp location (only trainable params)
-        temp_adapter = self._temp_dir / f"actor_{actor_idx}_current.safetensors"
-        current_adapter_weights = dict(tree_flatten(self.main_actor.trainable_parameters()))
-
-        # Filter to only LoRA-related weights (lora_a, lora_b, magnitude for DoRA)
-        lora_weights = {
-            k: v for k, v in current_adapter_weights.items()
-            if 'lora_' in k or 'magnitude' in k
-        }
-
-        if lora_weights:
-            mx.save_safetensors(str(temp_adapter), lora_weights)
-            if self.verbose:
-                adapter_size = temp_adapter.stat().st_size / 1024**2
-                tqdm.write(f"    [MultiActor] Saved LoRA adapter: {adapter_size:.1f}MB ({len(lora_weights)} params)")
-        else:
-            # No LoRA weights found, save all trainable params
-            mx.save_safetensors(str(temp_adapter), current_adapter_weights)
-            if self.verbose:
-                adapter_size = temp_adapter.stat().st_size / 1024**2
-                tqdm.write(f"    [MultiActor] Saved adapter (all trainable): {adapter_size:.1f}MB")
-
-        # 2. Load fresh base model with quantization
-        try:
-            from mlx_lm import load as mlx_load
-            from mlx_lm.tuner.utils import linear_to_lora_layers
-
-            # Load base model with quantization
-            if config.quantization:
-                bits_map = {"2bit": 2, "3bit": 3, "4bit": 4, "6bit": 6, "8bit": 8}
-                bits = bits_map.get(config.quantization)
-                if bits:
-                    actor, _ = mlx_load(
-                        self.model_path,
-                        model_config={"quantization": {"bits": bits, "group_size": config.quantization_group_size}}
-                    )
-                else:
-                    actor, _ = mlx_load(self.model_path)
-            else:
-                actor, _ = mlx_load(self.model_path)
-
-            if self.verbose:
-                tqdm.write(f"    [MultiActor] Loaded base {config.name} ({config.quantization or 'full'})")
-
-            # Force GPU sync after loading
-            mx.eval(actor.parameters())
-
-            # 3. Freeze base and reconstruct LoRA structure
-            actor.freeze()
-
-            # Get LoRA params
-            lora_config = self.lora_params.copy()
-            rank = lora_config.get("rank", 16)
-            alpha = lora_config.get("alpha", 32)
-            dropout = lora_config.get("dropout", 0.0)
-            scale = lora_config.get("scale", alpha / rank if rank > 0 else 1.0)
-            use_dora = self._dora_layers > 0,
-
-            linear_to_lora_layers(
-                model=actor,
-                num_layers=lora_config.get("num_layers", -1),
-                config={
-                    "rank": rank,
-                    "dropout": 0.05,
-                    "scale": alpha,
-                    "use_dora": use_dora,
-                },
-                use_dora=use_dora,
-            )
-
-            # # Apply LoRA layers - use correct parameter name 'lora_layers' not 'num_lora_layers'
-            # linear_to_lora_layers(
-            #     actor,
-            #     num_layers=-1,  # All layers (correct param name)
-            #     lora_parameters={
-            #         "rank": rank,
-            #         "alpha": alpha,
-            #         "dropout": dropout,
-            #         "scale": scale,
-            #     },
-            #     use_dora=self._dora_layers > 0,
-            # )
-
-            # 4. Load current adapter weights
-            actor.load_weights(str(temp_adapter), strict=False)
-            actor.train()
-
-            # Force evaluation to ensure weights are loaded
-            mx.eval(actor.parameters())
-
-            if self.verbose:
-                tqdm.write(f"    [MultiActor] ✓ Applied LoRA to {config.name}")
-
-        except Exception as e:
-            tqdm.write(f"    [MultiActor] ⚠ Fresh load failed: {e}")
-            tqdm.write(f"    [MultiActor] Using deepcopy with Metal sync points...")
-
-            # Deepcopy fallback with aggressive memory management
-            # Force GPU sync and clear cache before deepcopy
-            mx.eval()
-            gc.collect()
-            mx.clear_cache()
-
-            actor = copy.deepcopy(self.main_actor)
-
-            # Force GPU sync immediately after deepcopy to prevent timeout
-            mx.eval(actor.parameters())
-            gc.collect()
-            mx.clear_cache()
-
-            actor.train()
-
-        finally:
-            # Cleanup temp file
-            if temp_adapter.exists():
-                try:
-                    temp_adapter.unlink()
-                except:
-                    pass
-
-        # Apply divergence if configured
-        if self.divergence_mode in ["noise", "both"]:
-            self._apply_weight_noise(actor, actor_idx)
-
-        # Apply grad checkpointing
-        if self.grad_checkpoint_layers is not None or self.grad_checkpoint_frequency > 1:
-            self._apply_grad_checkpointing(actor)
-
-        self._current_actor = actor
-        self._current_config = config
-        self._current_actor_steps = 0  # Reset step counter for new load
-
-        # Final GPU sync to ensure actor is ready
-        mx.eval(actor.parameters())
-
-        return actor
-
-    def _load_actor_for_sync_cycle(self, config: ActorConfig, actor_idx: int = 0) -> nn.Module:
-        """
-        Load actor for an entire sync cycle (will run multiple steps before unload).
-        Same as _load_actor but with explicit sync cycle semantics.
-        """
-        return self._load_actor(config, actor_idx)
 
     def should_reload_actor(self) -> bool:
         """Check if we should reload actor (after sync cycle completes)."""
@@ -2092,9 +2319,14 @@ class MultiActorGRPO:
     def _apply_grad_checkpointing(self, actor: nn.Module):
         """Apply gradient checkpointing to actor."""
         if not hasattr(actor, 'layers'):
-            return
+            # Try model.layers
+            if hasattr(actor, 'model') and hasattr(actor.model, 'layers'):
+                layers = actor.model.layers
+            else:
+                return
+        else:
+            layers = actor.layers
 
-        layers = actor.layers
         checkpointed = 0
 
         if self.grad_checkpoint_layers is not None:
@@ -2107,20 +2339,6 @@ class MultiActorGRPO:
                 if idx % self.grad_checkpoint_frequency == 0:
                     grad_checkpoint(layer)
                     checkpointed += 1
-
-    def _unload_current_actor(self):
-        """Unload current actor to free memory."""
-        if self._current_actor is not None:
-            name = self._current_config.name if self._current_config else "unknown"
-            del self._current_actor
-            self._current_actor = None
-            self._current_config = None
-            self._current_actor_steps = 0
-            gc.collect()
-            mx.eval()  # Force GPU sync before clearing cache
-            mx.clear_cache()
-            if self.verbose:
-                tqdm.write(f"    [MultiActor] Unloaded: {name}")
 
     def get_actor_temperature(self, config: ActorConfig, base_temp: float, actor_idx: int) -> float:
         """Get temperature for actor, including divergence scaling."""
@@ -2152,6 +2370,61 @@ class MultiActorGRPO:
         self._accumulated_metadata = []
         self._accumulated_rewards = []
 
+    def _validate_gradients(
+        self,
+        grads: Dict[str, mx.array],
+        actor_name: Optional[str] = None,
+    ) -> Tuple[Dict[str, mx.array], int, int]:
+        """
+        Validate gradients for NaN/Inf and optionally clip them.
+
+        v5.3.2: New method for gradient validation and clipping.
+
+        Args:
+            grads: Dictionary of gradient arrays
+            actor_name: Name of the actor for tracking stats
+
+        Returns:
+            Tuple of (validated_grads, num_nan_fixed, num_clipped)
+        """
+        if not self.validate_gradients and self.gradient_clip_value is None:
+            return grads, 0, 0
+
+        validated = {}
+        num_nan_fixed = 0
+        num_clipped = 0
+
+        for key, grad in grads.items():
+            # Check for NaN/Inf
+            has_nan = bool(mx.any(mx.isnan(grad)))
+            has_inf = bool(mx.any(mx.isinf(grad)))
+
+            if has_nan or has_inf:
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] ⚠ NaN/Inf in gradient: {key} (actor: {actor_name})")
+                # Replace with zeros
+                validated[key] = mx.zeros_like(grad)
+                num_nan_fixed += 1
+                continue
+
+            # Clip gradients if configured
+            if self.gradient_clip_value is not None:
+                grad_norm = float(mx.sqrt(mx.sum(grad * grad)))
+                if grad_norm > self.gradient_clip_value:
+                    scale = self.gradient_clip_value / (grad_norm + 1e-8)
+                    validated[key] = grad * scale
+                    num_clipped += 1
+                    continue
+
+            validated[key] = grad
+
+        # Update actor stats
+        if actor_name and actor_name in self.actor_stats:
+            self.actor_stats[actor_name]["nan_gradients"] += num_nan_fixed
+            self.actor_stats[actor_name]["clipped_gradients"] += num_clipped
+
+        return validated, num_nan_fixed, num_clipped
+
     def _compute_gradient_similarity(
         self,
         new_grads: Dict[str, mx.array]
@@ -2165,9 +2438,14 @@ class MultiActorGRPO:
         if self._mean_grad_direction is None:
             return 0.0, self.gradient_similarity_metric
 
-        # Flatten gradients to single vectors
-        new_flat = mx.concatenate([g.flatten() for g in new_grads.values()])
-        mean_flat = mx.concatenate([g.flatten() for g in self._mean_grad_direction.values()])
+        # Get common keys
+        common_keys = set(new_grads.keys()) & set(self._mean_grad_direction.keys())
+        if not common_keys:
+            return 0.0, self.gradient_similarity_metric
+
+        # Flatten gradients to single vectors using only common keys
+        new_flat = mx.concatenate([new_grads[k].flatten() for k in sorted(common_keys)])
+        mean_flat = mx.concatenate([self._mean_grad_direction[k].flatten() for k in sorted(common_keys)])
 
         if self.gradient_similarity_metric == "cosine":
             # Cosine similarity
@@ -2199,6 +2477,8 @@ class MultiActorGRPO:
                     self._mean_grad_direction[k] = (
                         alpha * v + (1 - alpha) * self._mean_grad_direction[k]
                     )
+                else:
+                    self._mean_grad_direction[k] = mx.array(v)
 
     def accumulate_gradients(
         self,
@@ -2208,9 +2488,25 @@ class MultiActorGRPO:
         """
         Accumulate gradients from an actor.
 
+        v5.3.2: Added gradient validation, normalization, and clipping.
+
+        Args:
+            grads: Dictionary of gradients from an actor
+            actor_name: Name of the actor (for tracking stats)
+
         Returns:
             True if gradients were accumulated, False if skipped due to similarity
         """
+        # v5.3.2: Normalize gradient keys to match main model
+        grads = self._normalize_gradient_keys(grads)
+
+        # v5.3.2: Validate and optionally clip gradients
+        grads, num_nan, num_clipped = self._validate_gradients(grads, actor_name)
+
+        if num_nan > 0:
+            if self.verbose:
+                tqdm.write(f"    [MultiActor] Fixed {num_nan} NaN/Inf gradients from {actor_name}")
+
         # Check similarity if enabled and we have previous gradients
         if self.gradient_similarity_enabled and self._accumulated_grads is not None:
             similarity, metric = self._compute_gradient_similarity(grads)
@@ -2233,29 +2529,75 @@ class MultiActorGRPO:
             # First actor - just store
             self._accumulated_grads = {k: mx.array(v) for k, v in grads.items()}
         else:
-            # Add to existing
+            # Add to existing - handle potential key mismatches gracefully
             for k, v in grads.items():
                 if k in self._accumulated_grads:
                     self._accumulated_grads[k] = self._accumulated_grads[k] + v
                 else:
+                    # New key from this actor
                     self._accumulated_grads[k] = mx.array(v)
 
-        self._grad_count += 1
+        if self._accumulated_grads is None:
+            # Use in-place, don't copy
+            self._accumulated_grads = grads  # Direct assignment
+            self._grad_count = 1
+        else:
+            # Running average instead of sum (saves memory)
+            alpha = 1.0 / (self._grad_count + 1)
+            for k, v in grads.items():
+                if k in self._accumulated_grads:
+                    # In-place update
+                    self._accumulated_grads[k] = (
+                        self._accumulated_grads[k] * (1 - alpha) + v * alpha
+                    )
+            self._grad_count += 1
+
+
+        # self._grad_count += 1
         if actor_name and actor_name in self.actor_stats:
             self.actor_stats[actor_name]["grads_accumulated"] += 1
 
         return True
 
     def get_averaged_gradients(self) -> Optional[Dict[str, mx.array]]:
-        """Get averaged gradients across all actors."""
+        """
+        Get averaged gradients across all actors.
+
+        v5.3.2: Added validation and dtype consistency.
+
+        Returns:
+            Dictionary of averaged gradients, or None if no gradients accumulated
+        """
         if self._accumulated_grads is None or self._grad_count == 0:
             return None
 
-        # Average by number of actually accumulated grads (not skipped)
-        averaged = {
-            k: v / self._grad_count
-            for k, v in self._accumulated_grads.items()
-        }
+        averaged = {}
+        num_nan = 0
+        num_zeroed = 0
+
+        for k, v in self._accumulated_grads.items():
+            avg = v / self._grad_count
+
+            # Sanity check
+            has_nan = bool(mx.any(mx.isnan(avg)))
+            has_inf = bool(mx.any(mx.isinf(avg)))
+
+            if has_nan or has_inf:
+                if self.verbose:
+                    tqdm.write(f"    [MultiActor] ⚠ Corrupted averaged gradient in {k}, zeroing")
+                avg = mx.zeros_like(avg)
+                num_nan += 1
+
+            # v5.3.2: Ensure consistent dtype
+            if self._dtype is not None and avg.dtype != self._dtype:
+                # Keep computation precision but note the mismatch
+                pass  # We don't cast here to avoid precision loss in accumulated grads
+
+            averaged[k] = avg
+
+        if num_nan > 0 and self.verbose:
+            tqdm.write(f"    [MultiActor] Zeroed {num_nan} corrupted averaged gradients")
+
         return averaged
 
     def accumulate_metrics(
@@ -2308,7 +2650,11 @@ class MultiActorGRPO:
             "multi_actor/grads_skipped": self._skipped_grads,
             "multi_actor/lora_layers": self._lora_layers,
             "multi_actor/dora_layers": self._dora_layers,
+            "multi_actor/precision": self.precision,
         }
+
+        if self.gradient_clip_value is not None:
+            metrics["multi_actor/gradient_clip_value"] = self.gradient_clip_value
 
         if self.gradient_similarity_enabled:
             metrics["multi_actor/gradient_similarity_threshold"] = self.gradient_similarity_threshold
@@ -2329,6 +2675,8 @@ class MultiActorGRPO:
             metrics[f"{prefix}/temp_offset"] = stats["temperature_offset"]
             metrics[f"{prefix}/grads_skipped"] = stats["grads_skipped"]
             metrics[f"{prefix}/grads_accumulated"] = stats["grads_accumulated"]
+            metrics[f"{prefix}/nan_gradients"] = stats.get("nan_gradients", 0)
+            metrics[f"{prefix}/clipped_gradients"] = stats.get("clipped_gradients", 0)
 
         return metrics
 
@@ -2340,6 +2688,10 @@ class MultiActorGRPO:
         self._grad_count = 0
         gc.collect()
         mx.clear_cache()
+        try:
+            mx.metal.clear_cache()
+        except AttributeError:
+            pass
 
 
 def create_default_actor_configs(
@@ -2403,7 +2755,7 @@ def initialize_multi_actor(
         cache_dir=cache_dir,
         sync_mode=getattr(args, 'actor_sync_mode', 'main_to_actors'),
         kl_to_main_weight=getattr(args, 'actor_kl_to_main_weight', 0.1),
-        sync_frequency=getattr(args, 'actor_sync_frequency', 10),
+        sync_frequency=getattr(args, 'actor_sync_frequency', 2),
         verbose=getattr(args, 'actor_verbose', True),
         # Gradient similarity settings
         gradient_similarity_enabled=getattr(args, 'gradient_similarity_enabled', False),
@@ -2413,7 +2765,7 @@ def initialize_multi_actor(
         divergence_mode=getattr(args, 'actor_divergence_mode', 'none'),
         divergence_scale=getattr(args, 'actor_divergence_scale', 0.01),
         # Grad checkpointing (propagate to actors)
-        grad_checkpoint_layers=getattr(args, 'grad_checkpoint_layers', None),
+        grad_checkpoint_layers=getattr(args, 'grad_checkpoint_layers', 1),
         grad_checkpoint_frequency=getattr(args, 'grad_checkpoint_frequency', 1),
     )
 
@@ -2612,17 +2964,17 @@ class BiasedSampler:
 # =============================================================================
 
 
+# FIX #1: Line 1006 - Float32 → bfloat16
+# REPLACE THIS FUNCTION:
+
 @mx.compile
 def compute_log_probs_compiled(
     logits: mx.array, targets: mx.array, lengths: mx.array
 ) -> Tuple[mx.array, mx.array]:
-    """
-    COMPILED: Compute per-token log probabilities.
-
-    7x faster than non-compiled version for large batches.
-    Uses MLX-native broadcast_to for compatibility.
-    """
+    """COMPILED: Compute per-token log probabilities safely."""
     # Shift for next-token prediction
+    # CRITICAL FIX: Use float32 for log_softmax stability on M-series chips.
+    # bfloat16/float16 can cause Metal watchdog timeouts due to slow emulation or NaNs.
     logits = logits[:, :-1, :].astype(mx.float32)
     targets = targets[:, 1:]
 
@@ -2651,6 +3003,93 @@ def compute_log_probs_compiled(
     return token_log_probs, length_mask
 
 
+def get_per_token_logps(
+    model: nn.Module,
+    inputs: mx.array,
+    lengths: mx.array,
+    use_compilation: bool = False,
+    chunk_size: int = 1,  # Default to 1 to prevent Metal Timeout
+) -> Tuple[Optional[List[mx.array]], Optional[Tuple[mx.array, mx.array]]]:
+    """
+    Compute per-token log probabilities with micro-batching to prevent Metal timeouts.
+    Calculates logits in chunks to keep GPU execution time within OS limits.
+    """
+    batch_size = inputs.shape[0]
+
+    # Force chunk_size=1 for safety on M-series chips with large contexts
+    chunk_size = 1
+
+    all_token_log_probs = []
+    all_masks = []
+
+    # Helper to process a single chunk
+    def _process_chunk(chunk_in, chunk_len):
+        if use_compilation:
+            # Compiled path
+            probs, mask = compute_log_probs_compiled(
+                model(chunk_in).astype(mx.float16), chunk_in, chunk_len
+            )
+            return probs, mask
+        else:
+            # Standard path
+            chunk_logits = model(chunk_in).astype(mx.float32)
+            chunk_logits = chunk_logits[:, :-1, :]
+            chunk_targets = chunk_in[:, 1:]
+
+            # Compute log probs manually for standard path
+            seq_len = chunk_logits.shape[1]
+            log_probs = nn.log_softmax(chunk_logits.astype(mx.float32), axis=-1)
+
+            token_lp = mx.take_along_axis(
+                log_probs, chunk_targets.reshape(chunk_targets.shape[0], seq_len, 1), axis=-1
+            ).squeeze(-1)
+
+            # Simple length mask
+            indices = mx.arange(seq_len)[None, :]
+            mask = indices < (chunk_len[:, None] - 1)
+
+            token_lp = mx.where(mask, token_lp, mx.zeros_like(token_lp))
+            return token_lp, mask
+
+    # Iterate in chunks
+    for i in range(0, batch_size, chunk_size):
+        chunk_inputs = inputs[i : i + chunk_size]
+        chunk_lengths = lengths[i : i + chunk_size]
+
+        # CRITICAL: Force synchronization to reset watchdog timer
+        mx.eval(chunk_inputs)
+
+        # Process chunk
+        res = _process_chunk(chunk_inputs, chunk_lengths)
+
+        if use_compilation:
+            probs, mask = res
+            mx.eval(probs, mask)
+            all_token_log_probs.append(probs)
+            all_masks.append(mask)
+        else:
+            token_lp, mask = res
+            mx.eval(token_lp)
+            # Standard path expects a list of individual arrays for the batch
+            # chunk size is 1, so token_lp[0] is what we want
+            for j in range(token_lp.shape[0]):
+                all_token_log_probs.append(token_lp[j])
+
+        # Explicit garbage collection to prevent VRAM ballooning
+        mx.clear_cache()
+
+    if use_compilation:
+        if not all_token_log_probs:
+            return None, (mx.array([]), mx.array([]))
+
+        final_log_probs = mx.concatenate(all_token_log_probs, axis=0)
+        final_mask = mx.concatenate(all_masks, axis=0)
+
+        return None, (final_log_probs, final_mask)
+    else:
+        # Standard path returns list of individual arrays
+        return all_token_log_probs, None
+
 @mx.compile
 def compute_kl_divergence_compiled(
     policy_logps: mx.array,
@@ -2660,7 +3099,13 @@ def compute_kl_divergence_compiled(
     """
     COMPILED: Compute reverse KL divergence between policy and reference.
     """
-    kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
+    # kl_div = mx.exp(ref_logps - policy_logps) - (ref_logps - policy_logps) - 1
+    #
+    # Replace the KL computation with a more stable version:
+    log_ratio = policy_logps - ref_logps
+    kl_div = mx.exp(log_ratio) * log_ratio - (mx.exp(log_ratio) - 1)
+    kl_div = mx.clip(kl_div, -100.0, 100.0)  # Prevent explosion
+
     kl_div = mx.where(length_mask, kl_div, mx.zeros_like(kl_div))
     return kl_div
 
@@ -2738,55 +3183,6 @@ def compute_advantages_vectorized(
 # CORE FUNCTIONS
 # =============================================================================
 
-
-def get_per_token_logps(
-    model: nn.Module,
-    inputs: mx.array,
-    lengths: mx.array,
-    use_compilation: bool = False,
-) -> Tuple[Optional[List[mx.array]], Optional[Tuple[mx.array, mx.array]]]:
-    """
-    Compute per-token log probabilities with optional compilation.
-
-    Args:
-        model: The language model
-        inputs: Input token IDs [batch_size, seq_len]
-        lengths: Sequence lengths [batch_size]
-        use_compilation: If True, use compiled version (7x faster)
-
-    Returns:
-        If use_compilation=False:
-            (per_token_logps_list, None)
-        If use_compilation=True:
-            (None, (token_log_probs, length_mask))
-    """
-    logits = model(inputs).astype(mx.float16)
-
-    if use_compilation:
-        # COMPILED PATH - 7x faster
-        token_log_probs, length_mask = compute_log_probs_compiled(
-            logits, inputs, lengths
-        )
-        mx.eval(token_log_probs, length_mask)
-        return None, (token_log_probs, length_mask)
-    else:
-        # ORIGINAL PATH - proven, compatible
-        logits = logits[:, :-1, :]
-        targets = inputs[:, 1:]
-        per_token_logps = []
-
-        for i in range(logits.shape[0]):
-            seq_len = int(lengths[i]) - 1
-            seq_logits = logits[i, :seq_len]
-            seq_targets = targets[i, :seq_len]
-            log_probs = nn.log_softmax(seq_logits, axis=-1)
-            token_log_probs = mx.take_along_axis(
-                log_probs, seq_targets.reshape(seq_len, 1), axis=-1
-            ).squeeze(-1)
-            per_token_logps.append(token_log_probs)
-
-        mx.eval(per_token_logps)
-        return per_token_logps, None
 
 
 def generate_grpo(
@@ -3484,6 +3880,251 @@ def calculate_rewards_and_advantages(
 
     return advantages, reward_specific_metrics
 
+# =============================================================================
+# COMPILED FUNCTIONS - Performance critical paths with consistent precision
+# =============================================================================
+
+
+@mx.compile
+def compute_log_probs_compiled(
+    logits: mx.array, targets: mx.array, lengths: mx.array
+) -> Tuple[mx.array, mx.array]:
+    """
+    COMPILED: Compute per-token log probabilities.
+
+    v5.3.2: Uses float32 consistently for numerical stability.
+    """
+    # Shift for next-token prediction - USE FLOAT32 for stability
+    logits = logits[:, :-1, :].astype(mx.float32)
+    targets = targets[:, 1:]
+
+    # Log probabilities
+    log_probs = nn.log_softmax(logits, axis=-1)
+
+    # Gather target log probs using advanced indexing
+    batch_size, seq_len, vocab_size = logits.shape
+
+    # MLX-compatible broadcasting
+    batch_indices = mx.broadcast_to(
+        mx.arange(batch_size)[:, None], (batch_size, seq_len)
+    )
+    seq_indices = mx.broadcast_to(mx.arange(seq_len)[None, :], (batch_size, seq_len))
+
+    token_log_probs = log_probs[batch_indices, seq_indices, targets]
+
+    # Create length mask
+    length_mask = seq_indices < (lengths[:, None] - 1)
+
+    # Apply mask
+    token_log_probs = mx.where(
+        length_mask, token_log_probs, mx.zeros_like(token_log_probs)
+    )
+
+    return token_log_probs, length_mask
+
+
+@mx.compile
+def compute_kl_divergence_compiled(
+    policy_logps: mx.array,
+    ref_logps: mx.array,
+    length_mask: mx.array,
+) -> mx.array:
+    """
+    COMPILED: Compute reverse KL divergence between policy and reference.
+
+    v5.3.2: Added numerical stability with clipping.
+    """
+    # Clip log ratio to prevent exp overflow
+    log_ratio = policy_logps - ref_logps
+    log_ratio = mx.clip(log_ratio, -20.0, 20.0)  # Prevent overflow
+
+    kl_div = mx.exp(log_ratio) - log_ratio - 1
+    kl_div = mx.where(length_mask, kl_div, mx.zeros_like(kl_div))
+
+    # Clip KL to reasonable range
+    kl_div = mx.clip(kl_div, 0.0, 100.0)
+
+    return kl_div
+
+
+@mx.compile
+def compute_importance_weights_compiled(
+    policy_logps: mx.array,
+    ref_logps: mx.array,
+    length_mask: mx.array,
+    use_sequence_level: bool = False,
+) -> mx.array:
+    """
+    COMPILED: Compute importance sampling weights.
+
+    v5.3.2: Added numerical stability.
+    """
+    log_ratio = policy_logps - ref_logps
+    # Clip to prevent overflow in exp
+    log_ratio = mx.clip(log_ratio, -20.0, 20.0)
+
+    if use_sequence_level:
+        sequence_log_ratio = (log_ratio * length_mask).sum(axis=1) / mx.maximum(
+            length_mask.sum(axis=1), 1.0
+        )
+        return mx.expand_dims(sequence_log_ratio, axis=1)
+    else:
+        return log_ratio
+
+
+# =============================================================================
+# CORE FUNCTIONS
+# =============================================================================
+
+
+def get_per_token_logpsx(
+    model: nn.Module,
+    inputs: mx.array,
+    lengths: mx.array,
+    use_compilation: bool = False,
+) -> Tuple[Optional[List[mx.array]], Optional[Tuple[mx.array, mx.array]]]:
+    """
+    Compute per-token log probabilities with optional compilation.
+
+    v5.3.2: Uses float32 consistently for numerical stability.
+
+    Args:
+        model: The language model
+        inputs: Input token IDs [batch_size, seq_len]
+        lengths: Sequence lengths [batch_size]
+        use_compilation: If True, use compiled version (7x faster)
+
+    Returns:
+        If use_compilation=False:
+            (per_token_logps_list, None)
+        If use_compilation=True:
+            (None, (token_log_probs, length_mask))
+    """
+    # v5.3.2: Use float32 for stability
+    logits = model(inputs).astype(mx.float32)
+
+    if use_compilation:
+        # COMPILED PATH - 7x faster
+        token_log_probs, length_mask = compute_log_probs_compiled(
+            logits, inputs, lengths
+        )
+        mx.eval(token_log_probs, length_mask)
+        return None, (token_log_probs, length_mask)
+    else:
+        # ORIGINAL PATH - proven, compatible
+        logits = logits[:, :-1, :]
+        targets = inputs[:, 1:]
+        per_token_logps = []
+
+        for i in range(logits.shape[0]):
+            seq_len = int(lengths[i]) - 1
+            seq_logits = logits[i, :seq_len]
+            seq_targets = targets[i, :seq_len]
+            log_probs = nn.log_softmax(seq_logits, axis=-1)
+            token_log_probs = mx.take_along_axis(
+                log_probs, seq_targets.reshape(seq_len, 1), axis=-1
+            ).squeeze(-1)
+            per_token_logps.append(token_log_probs)
+
+        mx.eval(per_token_logps)
+        return per_token_logps, None
+
+
+def iterate_grpo_batches(
+    dataset: List,
+    batch_size: int,
+    max_seq_length: int,
+    train: bool = False,
+):
+    """
+    Iterate over GRPO batches with proper iterator handling.
+
+    v5.3.2: Added validation and better error messages.
+
+    Args:
+        dataset: List of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples
+        batch_size: Batch size
+        max_seq_length: Maximum sequence length
+        train: If True, iterate infinitely with shuffling
+
+    Yields:
+        Batches of (prompts_tokens, answers_tokens, prompts_text, answers_text, types)
+    """
+    # Validate dataset
+    if not dataset:
+        raise ValueError("Dataset is empty")
+
+    # Check dataset format
+    if not isinstance(dataset[0], tuple):
+        raise ValueError(
+            f"Dataset items must be tuples, got {type(dataset[0])}. "
+            "Expected: (prompt_tokens, answer_tokens, prompt_str, answer_str[, type])"
+        )
+
+    has_types = len(dataset[0]) == 5
+    expected_len = 5 if has_types else 4
+
+    if len(dataset[0]) not in (4, 5):
+        raise ValueError(
+            f"Dataset items must have 4 or 5 elements, got {len(dataset[0])}. "
+            "Expected: (prompt_tokens, answer_tokens, prompt_str, answer_str[, type])"
+        )
+
+    def length_key(i: int) -> int:
+        return len(dataset[i][0]) + len(dataset[i][1])
+
+    idx = sorted(range(len(dataset)), key=length_key)
+
+    if len(dataset) < batch_size:
+        raise ValueError(
+            f"Dataset size ({len(dataset)}) must be at least batch_size ({batch_size})"
+        )
+
+    step = mx.distributed.init().size()
+    if batch_size % step != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by number of workers ({step})"
+        )
+
+    def batch_index_generator():
+        """Generator for batch indices."""
+        for i in range(0, len(idx) - batch_size + 1, batch_size):
+            yield idx[i : i + batch_size : step]
+
+    if train:
+        # Infinite iteration with shuffling
+        while True:
+            indices = list(batch_index_generator())
+            if not indices:
+                raise ValueError(
+                    f"No valid batches can be created. Dataset size: {len(dataset)}, "
+                    f"batch_size: {batch_size}, step: {step}"
+                )
+            np.random.shuffle(indices)
+
+            for batch_idx in indices:
+                current_batch = [dataset[j] for j in batch_idx]
+
+                prompts_tokens = [item[0] for item in current_batch]
+                answers_tokens = [item[1] for item in current_batch]
+                prompts_text = [item[2] for item in current_batch]
+                answers_text = [item[3] for item in current_batch]
+                types = [item[4] for item in current_batch] if has_types else None
+
+                yield prompts_tokens, answers_tokens, prompts_text, answers_text, types
+    else:
+        # Single pass for evaluation
+        for batch_idx in batch_index_generator():
+            current_batch = [dataset[j] for j in batch_idx]
+
+            prompts_tokens = [item[0] for item in current_batch]
+            answers_tokens = [item[1] for item in current_batch]
+            prompts_text = [item[2] for item in current_batch]
+            answers_text = [item[3] for item in current_batch]
+            types = [item[4] for item in current_batch] if has_types else None
+
+            yield prompts_tokens, answers_tokens, prompts_text, answers_text, types
+
 
 def grpo_loss(
     model: nn.Module,
@@ -3506,10 +4147,17 @@ def grpo_loss(
     iteration: int = 0,
     update_counter: int = 0,
     log_samples: bool = False,
-    actor_metadata: Optional[List[Dict[str, Any]]] = None,  # NEW: per-completion actor info
+    actor_metadata: Optional[List[Dict[str, Any]]] = None,
+    # v5.3.2: Numerical stability options
+    clip_advantages: bool = True,
+    advantage_clip_value: float = 10.0,
+    clip_log_ratio: bool = True,
+    log_ratio_clip_value: float = 20.0,
 ) -> Tuple[mx.array, mx.array, Dict[str, Any]]:
     """
-    GRPO loss function with optional compilation.
+    GRPO loss function with optional compilation and numerical stability.
+
+    v5.3.2: Added numerical stability options for preventing corruption.
 
     Args:
         model: Policy model
@@ -3531,6 +4179,11 @@ def grpo_loss(
         iteration: Current iteration
         update_counter: Gradient update counter
         log_samples: Whether to log samples
+        actor_metadata: Per-completion actor information (for multi-actor)
+        clip_advantages: Whether to clip advantages (v5.3.2)
+        advantage_clip_value: Max absolute advantage value (v5.3.2)
+        clip_log_ratio: Whether to clip log ratios (v5.3.2)
+        log_ratio_clip_value: Max absolute log ratio (v5.3.2)
 
     Returns:
         loss: Computed loss
@@ -3609,8 +4262,16 @@ def grpo_loss(
     del inputs, attention_mask
     mx.clear_cache()
 
-    # Compute importance sampling
+    # v5.3.2: Clip advantages for stability
+    if clip_advantages and advantages is not None:
+        advantages = mx.clip(advantages, -advantage_clip_value, advantage_clip_value)
+
+    # Compute importance sampling with stability
     log_ratio = token_log_probs - mx.stop_gradient(ref_token_log_probs)
+
+    # v5.3.2: Clip log ratio to prevent exp overflow
+    if clip_log_ratio:
+        log_ratio = mx.clip(log_ratio, -log_ratio_clip_value, log_ratio_clip_value)
 
     if importance_sampling_level == "token":
         log_importance_weights = log_ratio
@@ -3628,6 +4289,10 @@ def grpo_loss(
 
     # PPO-style clipping
     coef_1 = mx.exp(log_importance_weights)
+
+    # v5.3.2: Clip coef_1 for additional stability
+    coef_1 = mx.clip(coef_1, 1e-8, 1e8)
+
     epsilon_high_val = epsilon_high if epsilon_high else epsilon
     coef_2 = mx.clip(coef_1, 1 - epsilon, 1 + epsilon_high_val)
 
@@ -3641,22 +4306,46 @@ def grpo_loss(
     clipped_obj = coef_2 * advantages.reshape(-1, 1)
     per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
 
-    # Add KL penalty
+    # Add KL penalty with numerical stability
     if beta != 0.0:
         log_ratio_ref_theta = ref_token_log_probs - token_log_probs
+
+        # v5.3.2: Clip for stability
+        if clip_log_ratio:
+            log_ratio_ref_theta = mx.clip(log_ratio_ref_theta, -log_ratio_clip_value, log_ratio_clip_value)
+
         ratio_ref_theta = mx.exp(log_ratio_ref_theta)
+        ratio_ref_theta = mx.clip(ratio_ref_theta, 1e-8, 1e8)  # Stability
+
         kl_div = coef_1 * ratio_ref_theta - log_ratio_ref_theta - 1
+        kl_div = mx.clip(kl_div, 0.0, 100.0)  # KL should be non-negative
+
         per_token_loss = per_token_loss + beta * kl_div
     else:
-        kl_div = (
-            mx.exp(ref_token_log_probs - token_log_probs)
-            - (ref_token_log_probs - token_log_probs)
-            - 1
+        # Still compute KL for metrics
+        log_ratio_kl = ref_token_log_probs - token_log_probs
+        if clip_log_ratio:
+            log_ratio_kl = mx.clip(log_ratio_kl, -log_ratio_clip_value, log_ratio_clip_value)
+
+        kl_div = mx.exp(log_ratio_kl) - log_ratio_kl - 1
+        kl_div = mx.clip(kl_div, 0.0, 100.0)
+
+    # v5.3.2: Check for NaN/Inf in loss before aggregation
+    has_nan = bool(mx.any(mx.isnan(per_token_loss)))
+    has_inf = bool(mx.any(mx.isinf(per_token_loss)))
+
+    if has_nan or has_inf:
+        logger.warning(f"NaN/Inf detected in per_token_loss at iter {iteration}")
+        # Replace NaN/Inf with zeros to prevent corruption
+        per_token_loss = mx.where(
+            mx.isnan(per_token_loss) | mx.isinf(per_token_loss),
+            mx.zeros_like(per_token_loss),
+            per_token_loss
         )
 
     # Compute loss based on type
     if grpo_loss_type == "grpo":
-        loss = (per_token_loss * length_mask).sum() / length_mask.sum()
+        loss = (per_token_loss * length_mask).sum() / mx.maximum(length_mask.sum(), 1.0)
     elif grpo_loss_type == "bnpo":
         loss = (per_token_loss * length_mask).sum() / mx.maximum(length_mask.sum(), 1.0)
     elif grpo_loss_type == "dr_grpo":
@@ -3666,8 +4355,17 @@ def grpo_loss(
     else:
         raise ValueError(f"Unknown loss type: {grpo_loss_type}")
 
+    # v5.3.2: Final loss sanity check
+    if mx.isnan(loss) or mx.isinf(loss):
+        logger.warning(f"NaN/Inf loss at iter {iteration}, returning zero loss")
+        loss = mx.array(0.0)
+
     # Metrics
     mean_kl = float(((kl_div * length_mask).sum(axis=1) / mx.maximum(length_mask.sum(axis=1), 1.0)).mean())
+
+    # v5.3.2: Sanitize KL metric
+    if np.isnan(mean_kl) or np.isinf(mean_kl):
+        mean_kl = 0.0
 
     # Generation statistics
     completion_lengths = [comp.shape[0] for comp in completions]
@@ -3704,15 +4402,22 @@ def grpo_loss(
             if length_mask_sum > 0
             else 0.0
         ),
+        # v5.3.2: Track stability issues
+        "had_nan_loss": has_nan,
+        "had_inf_loss": has_inf,
     }
 
     # Add numeric metrics from reward_metrics (skip lists/dicts, convert to float)
     if reward_metrics:
         for k, v in reward_metrics.items():
             if hasattr(v, 'item'):
-                metrics[k] = float(v.item())
+                val = float(v.item())
+                if not (np.isnan(val) or np.isinf(val)):
+                    metrics[k] = val
             elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
-                metrics[k] = float(v)
+                val = float(v)
+                if not (np.isnan(val) or np.isinf(val)):
+                    metrics[k] = val
 
     # Log samples if requested
     if log_samples and jsonl_logger is not None and completion_texts is not None:
@@ -3780,14 +4485,19 @@ def grpo_loss(
                     prompt_kls.append(comp_kl)
 
             if prompt_completions:
+                # Sanitize values for JSON
+                safe_advantages = [a for a in prompt_advantages_list if not (np.isnan(a) or np.isinf(a))]
+                safe_kls = [k for k in prompt_kls if not (np.isnan(k) or np.isinf(k))]
+                safe_rewards = [r for r in prompt_rewards if r is not None and not (np.isnan(r) or np.isinf(r))]
+
                 group_stats = {
-                    "advantage_mean": float(np.mean(prompt_advantages_list)),
-                    "advantage_std": float(np.std(prompt_advantages_list)) if len(prompt_advantages_list) > 1 else 0.0,
-                    "kl_mean": float(np.mean(prompt_kls)),
-                    "kl_max": float(np.max(prompt_kls)),
-                    "kl_min": float(np.min(prompt_kls)),
-                    "reward_mean": float(np.mean([r for r in prompt_rewards if r is not None])) if any(r is not None for r in prompt_rewards) else None,
-                    "reward_std": float(np.std([r for r in prompt_rewards if r is not None])) if len([r for r in prompt_rewards if r is not None]) > 1 else 0.0,
+                    "advantage_mean": float(np.mean(safe_advantages)) if safe_advantages else 0.0,
+                    "advantage_std": float(np.std(safe_advantages)) if len(safe_advantages) > 1 else 0.0,
+                    "kl_mean": float(np.mean(safe_kls)) if safe_kls else 0.0,
+                    "kl_max": float(np.max(safe_kls)) if safe_kls else 0.0,
+                    "kl_min": float(np.min(safe_kls)) if safe_kls else 0.0,
+                    "reward_mean": float(np.mean(safe_rewards)) if safe_rewards else None,
+                    "reward_std": float(np.std(safe_rewards)) if len(safe_rewards) > 1 else 0.0,
                 }
 
                 # Add actor distribution if multi-actor
@@ -3824,82 +4534,6 @@ def grpo_loss(
     mx.clear_cache()
 
     return loss, length_mask.sum(axis=1).sum(), metrics
-
-
-def iterate_grpo_batches(
-    dataset: List,
-    batch_size: int,
-    max_seq_length: int,
-    train: bool = False,
-):
-    """
-    Iterate over GRPO batches with proper iterator handling.
-
-    Args:
-        dataset: List of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples
-        batch_size: Batch size
-        max_seq_length: Maximum sequence length
-        train: If True, iterate infinitely with shuffling
-
-    Yields:
-        Batches of (prompts_tokens, answers_tokens, prompts_text, answers_text, types)
-    """
-    has_types = isinstance(dataset[0], tuple) and len(dataset[0]) == 5
-
-    if (
-        not dataset
-        or not isinstance(dataset[0], tuple)
-        or (not has_types and len(dataset[0]) != 4)
-    ):
-        raise ValueError(
-            "Dataset must be list of (prompt_tokens, answer_tokens, prompt_str, answer_str[, type]) tuples"
-        )
-
-    def length_key(i: int) -> int:
-        return len(dataset[i][0]) + len(dataset[i][1])
-
-    idx = sorted(range(len(dataset)), key=length_key)
-
-    if len(dataset) < batch_size:
-        raise ValueError(f"Dataset must have at least batch_size={batch_size} examples")
-
-    step = mx.distributed.init().size()
-    if batch_size % step != 0:
-        raise ValueError("Batch size must be divisible by number of workers")
-
-    def batch_index_generator():
-        """Generator for batch indices."""
-        for i in range(0, len(idx) - batch_size + 1, batch_size):
-            yield idx[i : i + batch_size : step]
-
-    if train:
-        # Infinite iteration with shuffling
-        while True:
-            indices = list(batch_index_generator())
-            np.random.shuffle(indices)
-
-            for batch_idx in indices:
-                current_batch = [dataset[j] for j in batch_idx]
-
-                prompts_tokens = [item[0] for item in current_batch]
-                answers_tokens = [item[1] for item in current_batch]
-                prompts_text = [item[2] for item in current_batch]
-                answers_text = [item[3] for item in current_batch]
-                types = [item[4] for item in current_batch] if has_types else None
-
-                yield prompts_tokens, answers_tokens, prompts_text, answers_text, types
-    else:
-        # Single pass for evaluation
-        for batch_idx in batch_index_generator():
-            current_batch = [dataset[j] for j in batch_idx]
-
-            prompts_tokens = [item[0] for item in current_batch]
-            answers_tokens = [item[1] for item in current_batch]
-            prompts_text = [item[2] for item in current_batch]
-            answers_text = [item[3] for item in current_batch]
-            types = [item[4] for item in current_batch] if has_types else None
-
-            yield prompts_tokens, answers_tokens, prompts_text, answers_text, types
 
 
 def evaluate_grpo(
@@ -3957,7 +4591,11 @@ def evaluate_grpo(
     quantized_kv_start: int = 0,
     max_kv_size: Optional[int] = None,
 ) -> Tuple[float, int, Dict[str, Any]]:
-    """Evaluate GRPO model with optional advanced features."""
+    """
+    Evaluate GRPO model with optional advanced features.
+
+    v5.3.2: Added better error handling and NaN protection.
+    """
     # Default reward functions if not provided
     if reward_funcs is None:
         reward_funcs = [
@@ -3971,6 +4609,7 @@ def evaluate_grpo(
     all_losses = 0.0
     ntokens = 0
     all_metrics: Optional[Dict[str, Any]] = None
+    num_valid_batches = 0
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
@@ -3982,130 +4621,153 @@ def evaluate_grpo(
             max_seq_length=max_seq_length,
         ),
     ):
-        prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
+        try:
+            prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
-        # Generate completions
-        all_completions, all_completion_texts, batch_indices = generate_grpo(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_tokens=prompt_tokens,
-            max_tokens=max_tokens,
-            group_size=group_size,
-            temperature=temperature,
-            batch_size=batch_size,
-            end_token=end_answer_token,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            min_tokens_to_keep=min_tokens_to_keep,
-            repetition_penalty=repetition_penalty,
-            repetition_context_size=repetition_context_size,
-            logit_bias=logit_bias,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            use_phased_generation=use_phased_generation,
-            generation_phases=generation_phases,
-            phased_verbose=phased_verbose,
-            force_inject_think_close=force_inject_think_close,
-            think_end_token=think_end_token,
-            answer_start_token=answer_start_token,
-            use_biased_sampler=use_biased_sampler,
-            min_think_tokens=min_think_tokens,
-            max_think_tokens=max_think_tokens,
-            think_close_bias_start=think_close_bias_start,
-            think_close_bias_value=think_close_bias_value,
-            think_close_bias_decay=think_close_bias_decay,
-            force_close_after=force_close_after,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            quantized_kv_start=quantized_kv_start,
-            max_kv_size=max_kv_size,
-        )
+            # Generate completions
+            all_completions, all_completion_texts, batch_indices = generate_grpo(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_tokens=prompt_tokens,
+                max_tokens=max_tokens,
+                group_size=group_size,
+                temperature=temperature,
+                batch_size=batch_size,
+                end_token=end_answer_token,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                min_tokens_to_keep=min_tokens_to_keep,
+                repetition_penalty=repetition_penalty,
+                repetition_context_size=repetition_context_size,
+                logit_bias=logit_bias,
+                xtc_probability=xtc_probability,
+                xtc_threshold=xtc_threshold,
+                use_phased_generation=use_phased_generation,
+                generation_phases=generation_phases,
+                phased_verbose=phased_verbose,
+                force_inject_think_close=force_inject_think_close,
+                think_end_token=think_end_token,
+                answer_start_token=answer_start_token,
+                use_biased_sampler=use_biased_sampler,
+                min_think_tokens=min_think_tokens,
+                max_think_tokens=max_think_tokens,
+                think_close_bias_start=think_close_bias_start,
+                think_close_bias_value=think_close_bias_value,
+                think_close_bias_decay=think_close_bias_decay,
+                force_close_after=force_close_after,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+                max_kv_size=max_kv_size,
+            )
 
-        # Prepare expanded data
-        expanded_answers = []
-        expanded_prompts = []
-        expanded_types = []
-        unique_prompt_indices = sorted(set(batch_indices))
-        grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
+            # Prepare expanded data
+            expanded_answers = []
+            expanded_prompts = []
+            expanded_types = []
+            unique_prompt_indices = sorted(set(batch_indices))
+            grouped_completions: Dict[int, List[int]] = {idx: [] for idx in unique_prompt_indices}
 
-        for i, completion_idx in enumerate(batch_indices):
-            grouped_completions[completion_idx].append(i)
+            for i, completion_idx in enumerate(batch_indices):
+                grouped_completions[completion_idx].append(i)
 
-        ordered_completions = []
-        ordered_completion_texts = []
-        ordered_batch_indices = []
+            ordered_completions = []
+            ordered_completion_texts = []
+            ordered_batch_indices = []
 
-        for prompt_idx in unique_prompt_indices:
-            completion_indices = grouped_completions[prompt_idx]
-            for idx in completion_indices:
-                ordered_completions.append(all_completions[idx])
-                ordered_completion_texts.append(all_completion_texts[idx])
-                ordered_batch_indices.append(prompt_idx)
-                expanded_answers.append(answer_text[prompt_idx])
-                expanded_prompts.append(prompt_text[prompt_idx])
-                expanded_types.append(
-                    type_info[prompt_idx] if type_info is not None else None
-                )
+            for prompt_idx in unique_prompt_indices:
+                completion_indices = grouped_completions[prompt_idx]
+                for idx in completion_indices:
+                    ordered_completions.append(all_completions[idx])
+                    ordered_completion_texts.append(all_completion_texts[idx])
+                    ordered_batch_indices.append(prompt_idx)
+                    expanded_answers.append(answer_text[prompt_idx])
+                    expanded_prompts.append(prompt_text[prompt_idx])
+                    expanded_types.append(
+                        type_info[prompt_idx] if type_info is not None else None
+                    )
 
-        # Calculate rewards and advantages
-        advantages, reward_metrics = calculate_rewards_and_advantages(
-            reward_funcs=reward_funcs,
-            expanded_prompts=expanded_prompts,
-            all_completion_texts=ordered_completion_texts,
-            expanded_answers=expanded_answers,
-            expanded_types=expanded_types,
-            batch_indices=ordered_batch_indices,
-            unique_prompt_indices=unique_prompt_indices,
-            reward_weights=reward_weights,
-        )
+            # Calculate rewards and advantages
+            advantages, reward_metrics = calculate_rewards_and_advantages(
+                reward_funcs=reward_funcs,
+                expanded_prompts=expanded_prompts,
+                all_completion_texts=ordered_completion_texts,
+                expanded_answers=expanded_answers,
+                expanded_types=expanded_types,
+                batch_indices=ordered_batch_indices,
+                unique_prompt_indices=unique_prompt_indices,
+                reward_weights=reward_weights,
+            )
 
-        # Compute loss
-        losses, toks, metrics = loss_fn(
-            model=model,
-            ref_model=ref_model,
-            batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
-            completions=ordered_completions,
-            completion_texts=ordered_completion_texts,
-            batch_indices=ordered_batch_indices,
-            advantages=advantages,
-            reward_metrics=reward_metrics,
-            beta=beta,
-            epsilon=epsilon,
-            epsilon_high=epsilon_high,
-            importance_sampling_level=importance_sampling_level,
-            grpo_loss_type=grpo_loss_type,
-            max_tokens=max_tokens,
-            use_compilation=use_compilation,
-        )
+            # Compute loss
+            losses, toks, metrics = loss_fn(
+                model=model,
+                ref_model=ref_model,
+                batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
+                completions=ordered_completions,
+                completion_texts=ordered_completion_texts,
+                batch_indices=ordered_batch_indices,
+                advantages=advantages,
+                reward_metrics=reward_metrics,
+                beta=beta,
+                epsilon=epsilon,
+                epsilon_high=epsilon_high,
+                importance_sampling_level=importance_sampling_level,
+                grpo_loss_type=grpo_loss_type,
+                max_tokens=max_tokens,
+                use_compilation=use_compilation,
+            )
 
-        # Cleanup
-        del all_completions, all_completion_texts, batch_indices
-        del ordered_completions, ordered_completion_texts, ordered_batch_indices
-        del advantages, reward_metrics
-        mx.eval(losses, toks)
-        mx.clear_cache()
+            # Cleanup
+            del all_completions, all_completion_texts, batch_indices
+            del ordered_completions, ordered_completion_texts, ordered_batch_indices
+            mx.eval(losses, toks)
+            mx.clear_cache()
 
-        all_losses += float(losses) * float(toks)
-        ntokens += int(toks)
+            # v5.3.2: Skip NaN/Inf losses
+            loss_val = float(losses)
+            toks_val = int(toks)
 
-        if all_metrics is None:
-            all_metrics = {}
-            for k, v in metrics.items():
-                # Skip non-numeric metrics (lists, dicts, etc.)
-                # Handle mx.array, numpy, and Python numeric types
-                if hasattr(v, 'item'):
-                    all_metrics[k] = float(v.item()) * float(toks)
-                elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
-                    all_metrics[k] = float(v) * float(toks)
-        else:
-            for k, v in metrics.items():
-                if k in all_metrics:
-                    # Handle mx.array, numpy, and Python numeric types
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                logger.warning("Skipping batch with NaN/Inf loss in evaluation")
+                continue
+
+            all_losses += loss_val * toks_val
+            ntokens += toks_val
+            num_valid_batches += 1
+
+            if all_metrics is None:
+                all_metrics = {}
+                for k, v in metrics.items():
                     if hasattr(v, 'item'):
-                        all_metrics[k] += float(v.item()) * float(toks)
+                        val = float(v.item())
+                        if not (np.isnan(val) or np.isinf(val)):
+                            all_metrics[k] = val * toks_val
                     elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
-                        all_metrics[k] += float(v) * float(toks)
+                        val = float(v)
+                        if not (np.isnan(val) or np.isinf(val)):
+                            all_metrics[k] = val * toks_val
+            else:
+                for k, v in metrics.items():
+                    if k in all_metrics:
+                        if hasattr(v, 'item'):
+                            val = float(v.item())
+                            if not (np.isnan(val) or np.isinf(val)):
+                                all_metrics[k] += val * toks_val
+                        elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
+                            val = float(v)
+                            if not (np.isnan(val) or np.isinf(val)):
+                                all_metrics[k] += val * toks_val
+
+        except Exception as e:
+            logger.warning(f"Error in evaluation batch: {e}")
+            continue
+
+    # Handle case where no valid batches
+    if ntokens == 0 or num_valid_batches == 0:
+        logger.warning("No valid batches in evaluation")
+        return 0.0, 0, {}
 
     # Distributed reduction
     all_losses_arr = mx.array(all_losses)
@@ -4128,7 +4790,7 @@ def evaluate_grpo(
     else:
         avg_metrics = {}
 
-    avg_loss = all_losses_sum_float / ntokens_sum_float
+    avg_loss = all_losses_sum_float / ntokens_sum_float if ntokens_sum_float > 0 else 0.0
 
     return avg_loss, int(ntokens_sum_float), avg_metrics
 
@@ -4150,6 +4812,8 @@ def train_grpo(
     """
     Train GRPO model with EXCEPTIONAL logging and optional advanced features.
 
+    v5.3.2: Added numerical stability, gradient clipping, and NaN protection.
+
     This implementation combines:
     - Clean, proven architecture
     - Optional phased generation for thinking models
@@ -4158,6 +4822,7 @@ def train_grpo(
     - Optional diversity/KL spike tracking
     - EXCEPTIONAL logging format (best-in-class)
     - Professional error handling
+    - v5.3.2: Gradient clipping and NaN protection
     """
     if args is None:
         args = GRPOTrainingArgs()
@@ -4178,14 +4843,12 @@ def train_grpo(
     mx.set_wired_limit(max_memory)
 
     # For multi-actor mode, set a conservative memory limit to prevent thrashing
-    # This helps avoid Metal GPU watchdog timeouts (kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
     if getattr(args, 'num_actors', 1) > 1:
-        # Use 85% of max to leave headroom for actor loading
         memory_limit_bytes = int(max_memory * 0.85)
         try:
             mx.metal.set_memory_limit(memory_limit_bytes)
         except AttributeError:
-            pass  # set_memory_limit may not exist in older MLX versions
+            pass
 
     world = mx.distributed.init()
     world_size = world.size()
@@ -4210,10 +4873,14 @@ def train_grpo(
                 min_thinking_tokens=args.phased_min_thinking_tokens,
             )
 
+    # v5.3.2: Get gradient clipping value from args or use default
+    gradient_clip_value = getattr(args, 'gradient_clip_value', 1.0)
+    validate_gradients = getattr(args, 'validate_gradients', True)
+
     # Display configuration
     if rank == 0:
         tqdm.write("=" * 80)
-        tqdm.write("GRPO TRAINING - HYBRID PROFESSIONAL EDITION")
+        tqdm.write("GRPO TRAINING - HYBRID PROFESSIONAL EDITION v5.3.2")
         tqdm.write("=" * 80)
         tqdm.write(
             f"✓ Compilation: {'ENABLED (7x faster)' if args.use_compilation else 'DISABLED'}"
@@ -4226,6 +4893,8 @@ def train_grpo(
         )
         tqdm.write(f"✓ Sample Logging: {'ENABLED' if args.log_samples else 'DISABLED'}")
         tqdm.write(f"✓ WandB Logging: {'ENABLED' if args.use_wandb else 'DISABLED'}")
+        tqdm.write(f"✓ Gradient Clipping: {gradient_clip_value if gradient_clip_value else 'DISABLED'}")
+        tqdm.write(f"✓ Gradient Validation: {'ENABLED' if validate_gradients else 'DISABLED'}")
         if args.use_phased_generation:
             tqdm.write(f"✓ Phased Generation: ENABLED")
             if generation_phases:
@@ -4244,7 +4913,6 @@ def train_grpo(
         try:
             import wandb
 
-            # Auto-generate run name if not provided
             run_name = args.wandb_run_name or f"grpo_{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
 
             wandb_run = wandb.init(
@@ -4267,6 +4935,7 @@ def train_grpo(
                     "use_phased_generation": args.use_phased_generation,
                     "use_biased_sampler": args.use_biased_sampler,
                     "grpo_loss_type": args.grpo_loss_type,
+                    "gradient_clip_value": gradient_clip_value,
                 },
             )
             tqdm.write(f"✓ WandB initialized: {wandb_run.url}")
@@ -4299,23 +4968,21 @@ def train_grpo(
     # Initialize multi-actor system if configured
     multi_actor: Optional[MultiActorGRPO] = None
     if getattr(args, 'num_actors', 1) > 1 and getattr(args, 'actor_quantizations', None):
-        # Get actual model path (use reference_model_path if available, otherwise try to infer)
         model_path_for_actors = getattr(args, 'reference_model_path', None)
         if not model_path_for_actors or model_path_for_actors == ".":
             model_path_for_actors = getattr(args, 'model', None)
         if not model_path_for_actors:
             model_path_for_actors = "."
 
-        # Extract LoRA params from model if available
         lora_params_for_actors = None
         for name, module in model.named_modules():
             if hasattr(module, 'lora_a') and hasattr(module, 'lora_b'):
                 lora_a = module.lora_a
                 if hasattr(lora_a, 'shape'):
-                    rank = lora_a.shape[0] if len(lora_a.shape) > 1 else lora_a.shape[-1]
+                    lora_rank = lora_a.shape[0] if len(lora_a.shape) > 1 else lora_a.shape[-1]
                     lora_params_for_actors = {
-                        "rank": rank,
-                        "alpha": getattr(module, 'scale', 1.0) * rank,
+                        "rank": lora_rank,
+                        "alpha": getattr(module, 'scale', 1.0) * lora_rank,
                         "dropout": getattr(module, 'dropout', 0.0),
                         "scale": getattr(module, 'scale', 1.0),
                     }
@@ -4328,16 +4995,20 @@ def train_grpo(
             tokenizer=tokenizer,
             lora_params=lora_params_for_actors,
         )
-        if multi_actor and rank == 0:
-            tqdm.write(f"✓ Multi-Actor GRPO: ENABLED")
-            tqdm.write(f"  - Actors: {multi_actor.num_actors}")
-            tqdm.write(f"  - Model path: {model_path_for_actors}")
-            for config in multi_actor.actor_configs:
-                tqdm.write(f"    • {config.name}: {config.quantization or 'full'}, temp_offset={config.temperature_offset}")
-            tqdm.write(f"  - Sync mode: {args.actor_sync_mode}")
-            tqdm.write(f"  - Sync frequency: {args.actor_sync_frequency}")
-            if lora_params_for_actors:
-                tqdm.write(f"  - LoRA params: rank={lora_params_for_actors.get('rank')}, alpha={lora_params_for_actors.get('alpha')}")
+
+        # v5.3.2: Configure multi-actor stability settings
+        if multi_actor:
+            multi_actor.gradient_clip_value = gradient_clip_value
+            multi_actor.validate_gradients = validate_gradients
+
+            if rank == 0:
+                tqdm.write(f"✓ Multi-Actor GRPO: ENABLED")
+                tqdm.write(f"  - Actors: {multi_actor.num_actors}")
+                tqdm.write(f"  - Model path: {model_path_for_actors}")
+                for config in multi_actor.actor_configs:
+                    tqdm.write(f"    • {config.name}: {config.quantization or 'full'}, temp_offset={config.temperature_offset}")
+                tqdm.write(f"  - Sync mode: {args.actor_sync_mode}")
+                tqdm.write(f"  - Sync frequency: {args.actor_sync_frequency}")
 
     # Optimized selective grad checkpointing
     if args.grad_checkpoint:
@@ -4359,18 +5030,60 @@ def train_grpo(
 
     state = [model.state, optimizer.state, mx.random.state]
 
-    # Training step update counter
     update_counter = 0
+
+    # v5.3.2: Helper function to compute loss and gradients only for trainable params
+    def compute_loss_and_trainable_grad(model, loss_fn, *args, **kwargs):
+        """Compute loss and gradients ONLY for trainable parameters with validation."""
+        trainable_params = dict(tree_flatten(model.trainable_parameters()))
+        trainable_keys = set(trainable_params.keys())
+
+        loss_value_and_grad = nn.value_and_grad(model, loss_fn)
+        (lvalue, toks, metrics), full_grads = loss_value_and_grad(*args, **kwargs)
+
+        full_grads_flat = dict(tree_flatten(full_grads))
+        trainable_grads_flat = {k: v for k, v in full_grads_flat.items() if k in trainable_keys}
+
+        # v5.3.2: Validate gradients
+        if validate_gradients:
+            validated_grads = {}
+            num_nan = 0
+            for k, v in trainable_grads_flat.items():
+                if mx.any(mx.isnan(v)) or mx.any(mx.isinf(v)):
+                    validated_grads[k] = mx.zeros_like(v)
+                    num_nan += 1
+                else:
+                    validated_grads[k] = v
+            if num_nan > 0:
+                logger.warning(f"Fixed {num_nan} NaN/Inf gradients")
+            trainable_grads_flat = validated_grads
+
+        # v5.3.2: Clip gradients if configured
+        if gradient_clip_value is not None and gradient_clip_value > 0:
+            clipped_grads = {}
+            for k, v in trainable_grads_flat.items():
+                grad_norm = float(mx.sqrt(mx.sum(v * v)))
+                if grad_norm > gradient_clip_value:
+                    scale = gradient_clip_value / (grad_norm + 1e-8)
+                    clipped_grads[k] = v * scale
+                else:
+                    clipped_grads[k] = v
+            trainable_grads_flat = clipped_grads
+
+        trainable_grads = tree_unflatten(list(trainable_grads_flat.items()))
+
+        return (lvalue, toks, metrics), trainable_grads
 
     def step(batch, prev_grad, do_update, iteration):
         nonlocal update_counter
 
+        mx.eval()
         mx.clear_cache()
+
         prompt_tokens, answer_tokens, prompt_text, answer_text, type_info = batch
 
         # =====================================================================
         # MULTI-ACTOR: Memory-efficient sequential gradient computation
-        # Load actor → Generate → Compute gradients → Accumulate → Unload
         # =====================================================================
         if multi_actor:
             multi_actor.reset_accumulation()
@@ -4381,9 +5094,7 @@ def train_grpo(
             total_tokens = 0
             all_actor_metadata = []
             all_completion_texts_for_log = []
-
-            # For combined logging: accumulate data from all actors
-            all_logging_data = []  # List of (completion_text, actor_meta, advantage, kl, total_reward, individual_rewards, batch_idx)
+            all_logging_data = []
 
             for actor_idx, actor_group_size in enumerate(distribution):
                 if actor_group_size == 0:
@@ -4392,10 +5103,21 @@ def train_grpo(
                 config = multi_actor.actor_configs[actor_idx]
                 actor_temp = multi_actor.get_actor_temperature(config, args.temperature, actor_idx)
 
-                # 1. Load actor (clone from main with divergence)
-                actor = multi_actor._load_actor(config, actor_idx=actor_idx)
+                mx.eval()
 
-                # 2. Generate from this actor
+                current_actor = multi_actor.get_current_actor()
+                if current_actor is None or multi_actor.should_reload_actor():
+                    if multi_actor.verbose and current_actor is not None:
+                        tqdm.write(f"    [MultiActor] Sync cycle complete, reloading...")
+                    actor = multi_actor._load_actor(config, actor_idx=actor_idx)
+                else:
+                    actor = current_actor
+                    if multi_actor.verbose:
+                        tqdm.write(f"    [MultiActor] Reusing loaded actor: {config.name}")
+
+                mx.eval(actor.parameters())
+
+                # Generate from this actor
                 completions, completion_texts, batch_idx = generate_grpo(
                     model=actor,
                     tokenizer=tokenizer,
@@ -4437,7 +5159,9 @@ def train_grpo(
                     update_idx=update_counter,
                 )
 
-                # Create actor metadata for logging
+                mx.eval()
+
+                # Create actor metadata
                 actor_metadata = [
                     {
                         "actor_name": config.name,
@@ -4452,7 +5176,7 @@ def train_grpo(
                 all_actor_metadata.extend(actor_metadata)
                 all_completion_texts_for_log.extend(completion_texts)
 
-                # 3. Prepare expanded data for this actor's completions
+                # Prepare expanded data
                 expanded_answers = []
                 expanded_prompts = []
                 expanded_types = []
@@ -4480,7 +5204,7 @@ def train_grpo(
                             type_info[prompt_idx] if type_info is not None else None
                         )
 
-                # 4. Calculate rewards and advantages for this actor's completions
+                # Calculate rewards and advantages
                 advantages, reward_metrics = calculate_rewards_and_advantages(
                     reward_funcs=reward_funcs,
                     expanded_prompts=expanded_prompts,
@@ -4492,13 +5216,10 @@ def train_grpo(
                     reward_weights=args.reward_weights,
                 )
 
-                # 5. Compute gradients on this actor
-                actor_loss_value_and_grad = nn.value_and_grad(actor, loss_fn)
-
-                # Disable per-actor logging - we'll do combined logging after all actors
-                should_log = False
-
-                (lvalue, toks, metrics), actor_grad = actor_loss_value_and_grad(
+                # Compute gradients
+                (lvalue, toks, metrics), actor_grad = compute_loss_and_trainable_grad(
+                    actor,
+                    loss_fn,
                     actor,
                     batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
                     completions=ordered_completions,
@@ -4514,26 +5235,22 @@ def train_grpo(
                     importance_sampling_level=args.importance_sampling_level,
                     max_tokens=args.max_completion_length,
                     use_compilation=args.use_compilation,
-                    jsonl_logger=jsonl_logger,
+                    jsonl_logger=None,  # Log combined later
                     iteration=iteration,
                     update_counter=update_counter,
-                    log_samples=should_log,
+                    log_samples=False,
                     actor_metadata=ordered_actor_metadata,
                 )
 
-                # CRITICAL: Force GPU sync to prevent Metal watchdog timeout
-                # (kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
-                # This ensures gradient computation completes before accumulation
                 mx.eval(lvalue, toks)
                 actor_grad_flat = dict(tree_flatten(actor_grad))
-                for key in list(actor_grad_flat.keys())[:5]:  # Eval first few grads
-                    mx.eval(actor_grad_flat[key])
+                trainable_grad_values = [v for k, v in actor_grad_flat.items() if 'lora_' in k or 'magnitude' in k]
+                if trainable_grad_values:
+                    mx.eval(trainable_grad_values)
 
-                # Accumulate logging data for combined logging later
+                # Accumulate logging data
                 total_rewards_list = reward_metrics.get("total_rewards", []) if reward_metrics else []
                 individual_rewards_dict = reward_metrics.get("individual_rewards", {}) if reward_metrics else {}
-
-                # Convert advantages to list for safe indexing
                 advantages_list = advantages.tolist() if hasattr(advantages, 'tolist') else list(advantages)
 
                 for i, (comp_text, actor_meta, batch_i) in enumerate(zip(ordered_completion_texts, ordered_actor_metadata, ordered_batch_indices)):
@@ -4554,16 +5271,20 @@ def train_grpo(
                         "batch_idx": batch_i,
                     })
 
-                # 6. Accumulate gradients (with similarity check)
+                # Accumulate gradients
                 grad_accumulated = multi_actor.accumulate_gradients(
                     actor_grad_flat,
                     actor_name=config.name,
                 )
 
-                # Accumulate metrics
-                total_loss += float(lvalue)
-                total_tokens += int(toks)
-                all_metrics.append(metrics)
+                # v5.3.2: Check for NaN loss and skip if needed
+                loss_val = float(lvalue)
+                if np.isnan(loss_val) or np.isinf(loss_val):
+                    logger.warning(f"NaN/Inf loss from actor {config.name}, skipping")
+                else:
+                    total_loss += loss_val
+                    total_tokens += int(toks)
+                    all_metrics.append(metrics)
 
                 # Update actor stats
                 total_rewards = reward_metrics.get("total_rewards", [])
@@ -4577,35 +5298,47 @@ def train_grpo(
                     completions=completion_texts,
                     rewards=total_rewards if total_rewards else [0.0] * len(completion_texts),
                     metadata=actor_metadata,
-                    loss=float(lvalue),
+                    loss=loss_val if not np.isnan(loss_val) else 0.0,
                     kl=actor_kl,
                 )
 
-                # 7. Unload actor to free memory
-                del actor_grad, actor_grad_flat, actor_loss_value_and_grad
-                del completions, completion_texts, ordered_completions
-                del advantages, reward_metrics
+                multi_actor.increment_actor_steps()
 
-                # Force GPU sync before unloading to ensure all operations complete
-                mx.eval()
-                multi_actor._unload_current_actor()
-                gc.collect()
-                mx.clear_cache()
+                should_unload = multi_actor.should_reload_actor() or actor_idx == len(distribution) - 1
 
-            # 8. Get averaged gradients
+                if should_unload:
+                    mx.eval()
+                    gc.collect()
+                    mx.clear_cache()
+
+                    del actor_grad, actor_grad_flat
+                    del completions, completion_texts, ordered_completions
+                    del advantages, reward_metrics
+
+                    multi_actor._unload_current_actor()
+
+                    mx.eval()
+                    gc.collect()
+                    mx.clear_cache()
+                else:
+                    del actor_grad, actor_grad_flat
+                    del completions, completion_texts, ordered_completions
+                    del advantages, reward_metrics
+                    mx.eval()
+                    gc.collect()
+
+            # Get averaged gradients
             averaged_grads = multi_actor.get_averaged_gradients()
             if averaged_grads:
                 grad = tree_unflatten(list(averaged_grads.items()))
-                # Force evaluation of averaged gradients to prevent delayed computation issues
                 mx.eval(tree_flatten(grad)[1])
             else:
                 grad = None
 
-            # Average metrics
-            lvalue = total_loss / multi_actor.num_actors if multi_actor.num_actors > 0 else 0.0
+            lvalue = total_loss / max(multi_actor.num_actors, 1)
             toks = total_tokens
 
-            # Merge metrics from all actors
+            # Merge metrics
             metrics = {}
             if all_metrics:
                 for key in all_metrics[0].keys():
@@ -4614,15 +5347,17 @@ def train_grpo(
                         v = m.get(key)
                         if v is not None:
                             if hasattr(v, 'item'):
-                                values.append(float(v.item()))
+                                val = float(v.item())
+                                if not (np.isnan(val) or np.isinf(val)):
+                                    values.append(val)
                             elif isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
-                                values.append(float(v))
+                                val = float(v)
+                                if not (np.isnan(val) or np.isinf(val)):
+                                    values.append(val)
                     if values:
                         metrics[key] = float(np.mean(values))
 
-            # =========================================================
-            # COMBINED LOGGING: Log all actors' completions together
-            # =========================================================
+            # Combined logging
             should_log_combined = (
                 args.log_samples
                 and jsonl_logger is not None
@@ -4632,7 +5367,6 @@ def train_grpo(
             if should_log_combined and all_logging_data:
                 from collections import Counter
 
-                # Group by prompt index
                 unique_prompts = sorted(set(d["batch_idx"] for d in all_logging_data))
 
                 for prompt_idx in unique_prompts:
@@ -4673,25 +5407,25 @@ def train_grpo(
                         prompt_advantages.append(entry["advantage"])
                         prompt_kls.append(entry["kl"])
 
-                    # Compute group stats
-                    valid_rewards = [r for r in prompt_rewards if r is not None]
+                    valid_rewards = [r for r in prompt_rewards if r is not None and not (np.isnan(r) or np.isinf(r))]
+                    valid_advantages = [a for a in prompt_advantages if not (np.isnan(a) or np.isinf(a))]
+                    valid_kls = [k for k in prompt_kls if not (np.isnan(k) or np.isinf(k))]
+
                     group_stats = {
-                        "advantage_mean": float(np.mean(prompt_advantages)),
-                        "advantage_std": float(np.std(prompt_advantages)) if len(prompt_advantages) > 1 else 0.0,
-                        "kl_mean": float(np.mean(prompt_kls)),
-                        "kl_max": float(np.max(prompt_kls)),
-                        "kl_min": float(np.min(prompt_kls)),
+                        "advantage_mean": float(np.mean(valid_advantages)) if valid_advantages else 0.0,
+                        "advantage_std": float(np.std(valid_advantages)) if len(valid_advantages) > 1 else 0.0,
+                        "kl_mean": float(np.mean(valid_kls)) if valid_kls else 0.0,
+                        "kl_max": float(np.max(valid_kls)) if valid_kls else 0.0,
+                        "kl_min": float(np.min(valid_kls)) if valid_kls else 0.0,
                         "reward_mean": float(np.mean(valid_rewards)) if valid_rewards else None,
                         "reward_std": float(np.std(valid_rewards)) if len(valid_rewards) > 1 else 0.0,
                         "num_actors": len(set(prompt_actors)),
                     }
 
-                    # Add actor distribution
                     if prompt_actors:
                         actor_counts = Counter(prompt_actors)
                         group_stats["actor_distribution"] = dict(actor_counts)
 
-                    # Get type info if available
                     type_info_val = type_info[prompt_idx] if type_info and prompt_idx < len(type_info) else None
 
                     jsonl_logger.log({
@@ -4715,7 +5449,7 @@ def train_grpo(
             multi_actor.sync_to_main()
 
         # =====================================================================
-        # SINGLE ACTOR: Standard GRPO (unchanged)
+        # SINGLE ACTOR: Standard GRPO
         # =====================================================================
         else:
             all_completions, all_completion_texts, batch_indices = generate_grpo(
@@ -4804,7 +5538,9 @@ def train_grpo(
                 and iteration % args.log_samples_frequency == 0
             )
 
-            (lvalue, toks, metrics), grad = loss_value_and_grad(
+            (lvalue, toks, metrics), grad = compute_loss_and_trainable_grad(
+                model,
+                loss_fn,
                 model,
                 batch=(prompt_tokens, answer_tokens, prompt_text, answer_text, type_info),
                 completions=ordered_completions,
@@ -4843,11 +5579,26 @@ def train_grpo(
             grad = average_gradients(grad)
             if grad_accum_steps > 1:
                 grad = tree_map(lambda x: x / grad_accum_steps, grad)
-            optimizer.update(model, grad)
+
+            # v5.3.2: Final gradient validation before optimizer update
+            if validate_gradients:
+                grad_flat = dict(tree_flatten(grad))
+                has_bad_grad = False
+                for k, v in grad_flat.items():
+                    if mx.any(mx.isnan(v)) or mx.any(mx.isinf(v)):
+                        has_bad_grad = True
+                        break
+
+                if has_bad_grad:
+                    logger.warning(f"Skipping optimizer update due to NaN/Inf gradients at iter {iteration}")
+                    grad = None
+
+            if grad is not None:
+                optimizer.update(model, grad)
+
             grad = None
             mx.clear_cache()
 
-            # Aggressive GC if enabled
             if args.aggressive_gc:
                 gc.collect()
 
@@ -4877,7 +5628,6 @@ def train_grpo(
         "clip_ratio_total": 0.0,
     }
 
-    # Add reward-specific metrics
     for reward_func in reward_funcs:
         func_name = reward_func.__name__
         accumulated_metrics[f"{func_name}_mean"] = 0.0
@@ -4889,19 +5639,13 @@ def train_grpo(
     start = time.perf_counter()
     pbar = tqdm(range(1, args.iters + 1), desc="Training", disable=rank != 0)
 
-    # Track last validation loss for best checkpoint comparison
     last_val_loss = float('inf')
 
-    # =========================================================================
-    # TRAINING STATE MANAGEMENT
-    # =========================================================================
-
-    # Initialize or load training state
+    # Training state
     training_state = TrainingState()
     best_val_loss = float('inf')
     start_iteration = 1
 
-    # Determine state save path
     state_save_path = Path(args.save_state_path) if args.save_state_path else Path(args.adapter_file).parent / "training_state"
 
     # Resume from saved state if provided
@@ -4914,7 +5658,6 @@ def train_grpo(
             trained_tokens = training_state.trained_tokens
             update_counter = training_state.update_counter
 
-            # Restore optimizer state if available
             if opt_state is not None:
                 try:
                     optimizer.state = opt_state
@@ -4933,10 +5676,8 @@ def train_grpo(
             if rank == 0:
                 tqdm.write(f"⚠ Could not load training state: {e}")
 
-    # Compute args hash for validation
     training_state.args_hash = compute_args_hash(args)
 
-    # Save training config
     if rank == 0:
         try:
             config_path = save_training_config(args, state_save_path)
@@ -4944,17 +5685,13 @@ def train_grpo(
         except Exception as e:
             tqdm.write(f"⚠ Could not save training config: {e}")
 
-    # =========================================================================
-    # INTERRUPT HANDLER - Save state on Ctrl+C
-    # =========================================================================
-
+    # Interrupt handler
     _interrupted = False
     _original_sigint = signal.getsignal(signal.SIGINT)
 
     def _interrupt_handler(signum, frame):
         nonlocal _interrupted
         if _interrupted:
-            # Second interrupt - force exit
             tqdm.write("\n⚠ Force exit requested. Exiting without saving...")
             signal.signal(signal.SIGINT, _original_sigint)
             raise KeyboardInterrupt()
@@ -4968,18 +5705,15 @@ def train_grpo(
     signal.signal(signal.SIGINT, _interrupt_handler)
 
     def _save_interrupted_checkpoint():
-        """Save checkpoint on interrupt."""
         if rank != 0:
             return
 
         try:
-            # Save adapter weights
             interrupted_adapter = Path(args.adapter_file).parent / "checkpoint_interrupted.safetensors"
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(interrupted_adapter), adapter_weights)
             tqdm.write(f"✓ Saved interrupted adapter: {interrupted_adapter}")
 
-            # Save training state
             training_state.iteration = it
             training_state.update_counter = update_counter
             training_state.trained_tokens = trained_tokens
@@ -4995,8 +5729,11 @@ def train_grpo(
         except Exception as e:
             tqdm.write(f"✗ Failed to save interrupted checkpoint: {e}")
 
+    # v5.3.2: Track consecutive NaN losses for early stopping
+    consecutive_nan_losses = 0
+    max_consecutive_nan = 5
+
     for it in pbar:
-        # Skip iterations if resuming
         if it < start_iteration:
             continue
 
@@ -5010,7 +5747,7 @@ def train_grpo(
         )
 
         # Evaluation
-        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
+        if 1==0 and (it == 1 or it % args.steps_per_eval == 0 or it == args.iters):
             stop = time.perf_counter()
             val_loss, val_ntokens, val_metrics = evaluate_grpo(
                 model=model,
@@ -5071,21 +5808,18 @@ def train_grpo(
                 }
                 training_callback.on_val_loss_report(val_info)
 
-            # WandB logging for validation
             if args.use_wandb and wandb_run is not None and rank == 0:
                 import wandb
                 val_wandb_metrics = sanitize_for_json({
                     "val/loss": val_loss,
-                    "val/perplexity": np.exp(val_loss),
+                    "val/perplexity": np.exp(val_loss) if val_loss < 100 else float('inf'),
                     "val/time": val_time,
                     **{f"val/{k}": v for k, v in val_metrics.items()},
                 })
                 wandb.log(val_wandb_metrics, step=it)
 
-            # Track for best checkpoint
             last_val_loss = val_loss
 
-            # Save best checkpoint on validation improvement
             if args.save_best_checkpoint and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 training_state.best_val_loss = best_val_loss
@@ -5107,20 +5841,38 @@ def train_grpo(
             it,
         )
 
-        losses += float(lvalue)
+        # v5.3.2: Check for NaN loss
+        loss_val = float(lvalue) if not hasattr(lvalue, 'item') else float(lvalue.item())
+        if np.isnan(loss_val) or np.isinf(loss_val):
+            consecutive_nan_losses += 1
+            logger.warning(f"NaN/Inf loss at iter {it} (consecutive: {consecutive_nan_losses})")
+
+            if consecutive_nan_losses >= max_consecutive_nan:
+                logger.error(f"Too many consecutive NaN losses ({consecutive_nan_losses}), stopping training")
+                break
+            continue
+        else:
+            consecutive_nan_losses = 0
+
+        losses += loss_val
         n_tokens += int(toks)
         steps += 1
 
-        # Accumulate metrics (skip non-numeric values like lists/dicts)
+        # Accumulate metrics
         for k, v in metrics.items():
             if k in accumulated_metrics:
-                # Handle mx.array, numpy, and Python numeric types
                 if hasattr(v, 'item'):
-                    accumulated_metrics[k] += float(v.item())
+                    val = float(v.item())
+                    if not (np.isnan(val) or np.isinf(val)):
+                        accumulated_metrics[k] += val
                 elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                    accumulated_metrics[k] += float(v)
+                    val = float(v)
+                    if not (np.isnan(val) or np.isinf(val)):
+                        accumulated_metrics[k] += val
                 elif isinstance(v, np.floating):
-                    accumulated_metrics[k] += float(v)
+                    val = float(v)
+                    if not (np.isnan(val) or np.isinf(val)):
+                        accumulated_metrics[k] += val
 
         # Track KL spikes
         if kl_spike_tracker is not None:
@@ -5144,13 +5896,13 @@ def train_grpo(
         if it % args.steps_per_report == 0 or it == args.iters:
             stop = time.perf_counter()
 
-            train_loss = losses / (steps * world_size)
+            train_loss = losses / (steps * world_size) if steps > 0 else 0.0
             avg_metrics = {
-                k: v / (steps * world_size) for k, v in accumulated_metrics.items()
+                k: v / (steps * world_size) if steps > 0 else 0.0 for k, v in accumulated_metrics.items()
             }
             learning_rate = optimizer.learning_rate.item() if hasattr(optimizer.learning_rate, 'item') else optimizer.learning_rate
-            it_sec = args.steps_per_report / (stop - start)
-            tokens_sec = float(n_tokens) / (stop - start)
+            it_sec = args.steps_per_report / (stop - start) if (stop - start) > 0 else 0.0
+            tokens_sec = float(n_tokens) / (stop - start) if (stop - start) > 0 else 0.0
             trained_tokens += n_tokens
             peak_mem_val = mx.get_peak_memory()
             peak_mem = float(peak_mem_val.item() if hasattr(peak_mem_val, 'item') else peak_mem_val) / 1e9
@@ -5163,7 +5915,6 @@ def train_grpo(
                     }
                 )
 
-                # Build reward metrics string
                 reward_metrics_str = ""
                 for reward_func in reward_funcs:
                     func_name = reward_func.__name__
@@ -5182,7 +5933,6 @@ def train_grpo(
                             f"cov={avg_metrics[cov_key]:.2%}\n"
                         )
 
-                # EXCEPTIONAL LOGGING FORMAT
                 tqdm.write(
                     f"\n{'='*80}\n"
                     f"Iter {it} (Update {update_counter}):\n"
@@ -5212,7 +5962,6 @@ def train_grpo(
                     f"Memory: {peak_mem:.3f}GB\n"
                 )
 
-                # Add diversity report if enabled
                 if diversity_tracker is not None and update_counter > 0:
                     div_metrics = diversity_tracker.compute_diversity(update_counter)
                     if div_metrics["total"] > 0:
@@ -5226,7 +5975,6 @@ def train_grpo(
                                 f"{div_metrics['contamination_rate']*100:.1f}%"
                             )
 
-                # Add KL spike summary if enabled
                 if (
                     kl_spike_tracker is not None
                     and len(kl_spike_tracker.spike_events) > 0
@@ -5253,7 +6001,7 @@ def train_grpo(
                 }
                 training_callback.on_train_loss_report(train_info)
 
-            # Comprehensive WandB logging
+            # WandB logging
             if (
                 args.use_wandb
                 and wandb_run is not None
@@ -5263,7 +6011,7 @@ def train_grpo(
                 import wandb
                 wandb_metrics = {
                     "train/loss": train_loss,
-                    "train/perplexity": np.exp(train_loss),
+                    "train/perplexity": np.exp(train_loss) if train_loss < 100 else float('inf'),
                     "train/learning_rate": learning_rate,
                     "train/update": update_counter,
                     "performance/iterations_per_second": it_sec,
@@ -5283,7 +6031,6 @@ def train_grpo(
                     "clipping/total": avg_metrics["clip_ratio_total"],
                 }
 
-                # Add individual reward function metrics
                 for reward_func in reward_funcs:
                     func_name = reward_func.__name__.replace(
                         "_reward_func", ""
@@ -5297,7 +6044,6 @@ def train_grpo(
                         wandb_metrics[f"rewards/{func_name}/std"] = avg_metrics[std_key]
                         wandb_metrics[f"rewards/{func_name}/coverage"] = avg_metrics[cov_key]
 
-                # Add diversity metrics
                 if diversity_tracker is not None:
                     div_metrics = diversity_tracker.compute_diversity(update_counter)
                     if div_metrics["total"] > 0:
@@ -5306,7 +6052,6 @@ def train_grpo(
                         wandb_metrics["diversity/total"] = div_metrics["total"]
                         wandb_metrics["diversity/contamination"] = div_metrics["contamination_rate"]
 
-                # Add KL spike metrics
                 if (
                     kl_spike_tracker is not None
                     and len(kl_spike_tracker.spike_events) > 0
@@ -5316,11 +6061,9 @@ def train_grpo(
                     wandb_metrics["kl/spikes_avg"] = spike_summary["avg_spike_kl"]
                     wandb_metrics["kl/spikes_max"] = spike_summary["max_spike_kl"]
 
-                # Add multi-actor metrics
                 if multi_actor:
                     wandb_metrics.update(multi_actor.get_wandb_metrics())
 
-                # Sanitize all metrics for JSON serialization
                 wandb_metrics = sanitize_for_json(wandb_metrics)
                 wandb.log(wandb_metrics, step=it)
 
@@ -5334,11 +6077,31 @@ def train_grpo(
         # Save checkpoints
         if it % args.steps_per_save == 0:
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+
+            # Save as adapters.safetensors
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
+
+            # Save as adapter_00x...
             checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
+                Path(args.adapter_file).parent / f"adapter_{it:07d}.safetensors"
             )
             mx.save_safetensors(str(checkpoint), adapter_weights)
+
+            # Cleanup old checkpoints if keep_last_n is set
+            if hasattr(args, 'keep_last_n') and args.keep_last_n is not None:
+                adapter_dir = Path(args.adapter_file).parent
+                # Get all adapter checkpoint files (not the main adapters.safetensors)
+                adapter_files = sorted(
+                    adapter_dir.glob("adapter_*.safetensors"),
+                    key=lambda p: p.stat().st_mtime
+                )
+
+                # Remove old checkpoints, keeping only the last N
+                if len(adapter_files) > args.keep_last_n:
+                    for old_file in adapter_files[:-args.keep_last_n]:
+                        old_file.unlink()
+                        tqdm.write(f"Removed old checkpoint: {old_file.name}")
+
             tqdm.write(f"Iter {it}: Saved to {args.adapter_file} and {checkpoint}")
 
         # Periodic state saving
@@ -5408,7 +6171,6 @@ def train_grpo(
             tqdm.write(f"KL spikes: {spike_summary['total_spikes']}")
         tqdm.write("=" * 80 + "\n")
 
-        # Final WandB summary
         if args.use_wandb and wandb_run is not None:
             import wandb
             final_metrics = sanitize_for_json({

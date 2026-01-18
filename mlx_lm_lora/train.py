@@ -24,6 +24,266 @@ Fixes:
 # # At start of training
 # import mlx.core as mx
 # mx.metal.set_memory_limit(88 * 1024**3)  # 48GB limit
+import sys
+import os
+import logging
+import asyncio
+import signal
+import threading
+import tracemalloc
+import functools
+import json
+import atexit
+import traceback
+import platform
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Any, Optional
+
+# ==============================================================================
+#  ENTERPRISE PRODUCTION BOOTSTRAPPER (v2.0 - Deep Forensics)
+# ==============================================================================
+
+class Production:
+    """
+    Drop-in suite for Observability, Safety, and Deep Error Tracing.
+
+    Features:
+    - FORENSIC LOGGING: Auto-captures full stack traces for every crash.
+    - DUAL OUTPUT:
+        1. Console: Beautiful, high-contrast logs (Rich).
+        2. File: Structured JSONL with 'exc_info' for log aggregators.
+    - SAFETY NETS: Catches unawaited async errors, thread crashes, and SIGINT.
+
+    Usage:
+        @Production.entrypoint
+        async def main(): ...
+    """
+
+    # --- Configuration ---
+    APP_NAME = os.getenv("APP_NAME", Path(sys.argv[0]).stem)
+    LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+    DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+    TRACE_MEM = os.getenv("TRACE_MEM", "false").lower() in ("true", "1", "yes")
+
+    # --- Optional Capabilities ---
+    try:
+        from rich.logging import RichHandler
+        from rich.traceback import install as install_rich_traceback
+        RICH_AVAILABLE = True
+    except ImportError:
+        RICH_AVAILABLE = False
+
+    try:
+        import click
+        CLICK_AVAILABLE = True
+    except ImportError:
+        CLICK_AVAILABLE = False
+
+    @classmethod
+    def _setup_logging(cls) -> logging.Logger:
+        """Configures the logging pipeline with forensic capabilities."""
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG if cls.DEBUG else logging.INFO)
+        root.handlers.clear()
+
+        # --- 1. File Handler (JSONL - Machine Readable & Complete) ---
+        try:
+            cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_file = cls.LOG_DIR / f"{cls.APP_NAME}_{datetime.now():%Y-%m-%d}.jsonl"
+
+            class ForensicJsonFormatter(logging.Formatter):
+                """Serializes logs + full tracebacks to JSON."""
+                def format(self, record):
+                    log_obj = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "lvl": record.levelname,
+                        "logger": record.name,
+                        "msg": record.getMessage(),
+                        "ctx": {
+                            "file": record.filename,
+                            "line": record.lineno,
+                            "func": record.funcName,
+                            "pid": os.getpid(),
+                            "thread": record.threadName,
+                        }
+                    }
+
+                    # Capture Exception Details
+                    if record.exc_info:
+                        log_obj["error"] = {
+                            "type": record.exc_info[0].__name__,
+                            "message": str(record.exc_info[1]),
+                            "traceback": "".join(traceback.format_exception(*record.exc_info))
+                        }
+
+                    return json.dumps(log_obj)
+
+            file_h = logging.FileHandler(log_file, encoding="utf-8")
+            file_h.setFormatter(ForensicJsonFormatter())
+            # File always records EVERYTHING (DEBUG) for post-mortem analysis
+            file_h.setLevel(logging.DEBUG)
+            root.addHandler(file_h)
+        except Exception as e:
+            sys.stderr.write(f"!! Failed to setup file logging: {e}\n")
+
+        # --- 2. Console Handler (Human Readable) ---
+        if cls.RICH_AVAILABLE:
+            # Rich prints locals on crash if Debug is True
+            cls.install_rich_traceback(show_locals=cls.DEBUG, width=120)
+            console_h = cls.RichHandler(
+                rich_tracebacks=True,
+                markup=True,
+                omit_repeated_times=False,
+                show_path=False,
+                log_time_format="[%X]"
+            )
+        else:
+            console_h = logging.StreamHandler(sys.stdout)
+            console_h.setFormatter(logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+            ))
+
+        console_h.setLevel(logging.DEBUG if cls.DEBUG else logging.INFO)
+        root.addHandler(console_h)
+
+        # Silence noisy libraries
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+        return logging.getLogger(cls.APP_NAME)
+
+    @classmethod
+    def _setup_safety_nets(cls, log: logging.Logger):
+        """Hooks into system events to catch fatal crashes."""
+
+        # 1. Catch Uncaught Sync Exceptions
+        def global_except_hook(exc_type, exc_value, exc_traceback):
+            if issubclass(exc_type, KeyboardInterrupt):
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+                return
+            log.critical("FATAL: Uncaught Exception", exc_info=(exc_type, exc_value, exc_traceback))
+        sys.excepthook = global_except_hook
+
+        # 2. Catch Uncaught Thread Exceptions (Python 3.8+)
+        if hasattr(threading, 'excepthook'):
+            def thread_except_hook(args):
+                if issubclass(args.exc_type, SystemExit):
+                    return
+                log.critical(f"FATAL: Thread '{args.thread.name}' Crashed",
+                             exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+            threading.excepthook = thread_except_hook
+
+        # 3. Shutdown Diagnostics
+        if cls.TRACE_MEM:
+            tracemalloc.start()
+            log.debug("Diagnostics: Memory tracing active.")
+
+        def shutdown_hook():
+            # Run on exit
+            if cls.TRACE_MEM:
+                curr, peak = tracemalloc.get_traced_memory()
+                log.info(f"--- Resource Report: Peak Mem {peak / 1024 / 1024:.2f} MB ---")
+
+            active = threading.enumerate()
+            if len(active) > 1:
+                stragglers = [t.name for t in active if t != threading.current_thread()]
+                if stragglers:
+                    log.warning(f"--- Zombie Threads Detected: {stragglers} ---")
+
+        atexit.register(shutdown_hook)
+
+    @staticmethod
+    def entrypoint(func: Callable) -> Callable:
+        """The Magic Decorator."""
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Bootstrap Phase
+            log = Production._setup_logging()
+            Production._setup_safety_nets(log)
+
+            meta = {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "pid": os.getpid()
+            }
+            log.info(f"Booting {Production.APP_NAME}", extra={"meta": meta})
+
+            # Execution Phase
+            try:
+                if asyncio.iscoroutinefunction(func):
+                    return Production._run_async(func, log, *args, **kwargs)
+                else:
+                    return func(*args, **kwargs)
+            except KeyboardInterrupt:
+                log.warning("Graceful Shutdown (Signal Received)")
+                sys.exit(0)
+            except Exception as e:
+                # Fallback for main-loop crashes
+                log.critical("Fatal Application Crash", exc_info=e)
+                sys.exit(1)
+        return wrapper
+
+    @staticmethod
+    def _run_async(coro_func, log, *args, **kwargs):
+        """Asyncio Harness with 'Fire-and-Forget' protection."""
+        async def runner():
+            loop = asyncio.get_running_loop()
+
+            # Catch "Task exception was never retrieved" (Background tasks)
+            def handle_async_exception(loop, context):
+                msg = context.get("message", "Unhandled Async Exception")
+                exc = context.get("exception")
+
+                # Filter out benign cancellations
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+                    return
+
+                # Extract source if available
+                source = ""
+                if "source_traceback" in context:
+                    source = "".join(traceback.format_list(context["source_traceback"]))
+
+                log.error(f"{msg}\nTask Origin:\n{source}", exc_info=exc)
+
+            loop.set_exception_handler(handle_async_exception)
+
+            # Signal Handling
+            stop_event = asyncio.Event()
+            if sys.platform != "win32":
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, lambda: stop_event.set())
+
+            # Launch Main
+            task = asyncio.create_task(coro_func(*args, **kwargs))
+
+            # Monitor
+            monitor = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait(
+                [task, monitor],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cleanup
+            if task in pending:
+                log.info("Signal received. Cancelling main task...")
+                task.cancel()
+                try: await task
+                except asyncio.CancelledError: pass
+
+            # Kill stragglers
+            stragglers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if stragglers:
+                log.debug(f"Cleaning {len(stragglers)} background tasks...")
+                for t in stragglers: t.cancel()
+                await asyncio.gather(*stragglers, return_exceptions=True)
+
+        return asyncio.run(runner())
+
+# ==============================================================================
+#  END BOOTSTRAP LAYER (Test Below)
+# ==============================================================================
+
+
 
 from pathlib import Path
 import importlib.util
@@ -130,8 +390,8 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     # LoRA parameters - now configurable via config file
     "lora_parameters": {
-        "rank": 16,
-        "alpha": 32,
+        "rank": 128,
+        "alpha": 256,
         "dropout": 0.05,
         "scale": 2.0,
     },
@@ -253,6 +513,20 @@ def build_parser():
         type=str,
         help="The path to the local model directory or Hugging Face repo.",
     )
+
+    parser.add_argument(
+        "--load-in-2bits",
+        action="store_true",
+        help="Load the model in 2-bit quantization.",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--load-in-3bits",
+        action="store_true",
+        help="Load the model in 3-bit quantization.",
+        default=None,
+    )
     parser.add_argument(
         "--load-in-4bits",
         action="store_true",
@@ -296,7 +570,7 @@ def build_parser():
     parser.add_argument(
         "--train-mode",
         type=str,
-        default="sft",
+        default="grpo",
         choices=["sft", "dpo", "cpo", "orpo", "grpo", "online_dpo", "xpo", "rlhf"],
         help="Training mode: sft, dpo, rlhf, online_dpo, xpo, cpo, orpo, or grpo, default is sft",
     )
@@ -311,7 +585,7 @@ def build_parser():
         "--mask-prompt",
         action="store_true",
         help="Mask the prompt in the loss when training",
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--num-layers",
@@ -329,7 +603,7 @@ def build_parser():
         "--gradient-accumulation-steps",
         type=int,
         help="Number of gradient accumulation steps.",
-        default=1,
+        default=2,
     )
     parser.add_argument(
         "--val-batches",
@@ -421,7 +695,7 @@ def build_parser():
         "--lora-dropout",
         type=float,
         help="LoRA dropout (0.0 enables fast kernels).",
-        default=0.05,
+        default=0.00,
     )
     parser.add_argument(
         "--lora-scale",
@@ -441,7 +715,7 @@ def build_parser():
         "--reward-scaling",
         type=float,
         help="Reward scaling factor for ORPO training, not implemented.",
-        default=1.0,
+        default=1.3,
     )
 
     # DPO args
@@ -499,13 +773,13 @@ def build_parser():
         "--temperature",
         type=float,
         help="Temperature for sampling.",
-        default=0.8,
+        default=0.3,
     )
     parser.add_argument(
         "--reward-weights",
         type=str,
         help="Weights for each reward function in format [0.1, 0.2, ...].",
-        default=None,
+        default=1.3,
     )
     parser.add_argument(
         "--reward-functions",
@@ -560,7 +834,7 @@ def build_parser():
         "--phased-thinking-max-tokens",
         type=int,
         help="Max tokens for thinking phase.",
-        default=192,
+        default=320,
     )
     parser.add_argument(
         "--phased-answer-max-tokens",
@@ -572,7 +846,7 @@ def build_parser():
         "--phased-min-thinking-tokens",
         type=int,
         help="Minimum tokens before allowing </think>.",
-        default=10,
+        default=60,
     )
 
     # GRPO BiasedSampler (legacy)
@@ -588,19 +862,19 @@ def build_parser():
         "--top-p",
         type=float,
         help="Top-p sampling parameter.",
-        default=0.8,
+        default=0.7,
     )
     parser.add_argument(
         "--top-k",
         type=int,
         help="Top-k sampling parameter.",
-        default=30,
+        default=50,
     )
     parser.add_argument(
         "--repetition-penalty",
         type=float,
         help="Repetition penalty (1.0 = no penalty).",
-        default=1.2,
+        default=1.1,
     )
 
     # Multi-Actor GRPO (NEW)
@@ -632,7 +906,7 @@ def build_parser():
     parser.add_argument(
         "--actor-sync-frequency",
         type=int,
-        default=8,
+        default=2,
         help="Sync weights every N training steps.",
     )
     parser.add_argument(
@@ -672,13 +946,13 @@ def build_parser():
         "--actor-divergence-mode",
         type=str,
         choices=["none", "temperature", "noise", "both"],
-        default="both",
+        default="none",
         help="Divergence mode: 'none', 'temperature', 'noise', 'both'.",
     )
     parser.add_argument(
         "--actor-divergence-scale",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Scale factor for divergence (temp multiplier or noise std).",
     )
 
@@ -740,6 +1014,14 @@ def build_parser():
         help="Token that starts answer phase (e.g., '<answer>'). If None, not injected.",
     )
 
+
+    parser.add_argument(
+        "--keep-last-n",
+        type=int,
+        default=3,
+        help="Keep only the last N adapter checkpoints (None = keep all)"
+    )
+
     return parser
 
 
@@ -773,8 +1055,8 @@ def train_model(
         # Use LoRA parameters from config (not hardcoded!)
         # Priority: CLI args > config file > defaults
         lora_params = args.lora_parameters.copy() if hasattr(args, 'lora_parameters') and args.lora_parameters else {
-            "rank": 16,
-            "alpha": 32,
+            "rank": 128,
+            "alpha": 256,
             "dropout": 0.05,
             "scale": 2.0,
         }
@@ -1133,8 +1415,8 @@ def train_model(
             phased_thinking_max_tokens=getattr(args, 'phased_thinking_max_tokens', 1500),
             phased_answer_max_tokens=getattr(args, 'phased_answer_max_tokens', 500),
             phased_min_thinking_tokens=getattr(args, 'phased_min_thinking_tokens', 50),
-            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.7),
-            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.5),
+            phased_thinking_temperature=getattr(args, 'phased_thinking_temperature', 0.5),
+            phased_answer_temperature=getattr(args, 'phased_answer_temperature', 0.3),
             phased_verbose=getattr(args, 'phased_verbose', False),
             # BiasedSampler (legacy)
             use_biased_sampler=getattr(args, 'use_biased_sampler', False),
@@ -1428,6 +1710,10 @@ def run(args, training_callback: TrainingCallback = None):
         )
 
     # Load model with optional quantization
+    if args.load_in_2bits:
+        quantization_config = {"bits": 2, "group_size": 64}
+    if args.load_in_3bits:
+        quantization_config = {"bits": 3, "group_size": 64}
     if args.load_in_4bits:
         quantization_config = {"bits": 4, "group_size": 64}
     elif args.load_in_6bits:
@@ -1471,6 +1757,8 @@ def run(args, training_callback: TrainingCallback = None):
         )
 
 
+
+@Production.entrypoint
 def main(args=None):
     """Main entry point."""
     import os

@@ -134,7 +134,7 @@ FEWSHOT_IDENTITY_TURNS = [
 class IdentityConfig:
     """Configuration for identity injection."""
 
-    enabled: bool = True
+    enabled: bool = False
     injection_probability: float = 0.85
     filter_unwanted_words: bool = True
     identity_samples_path: Optional[str] = None
@@ -144,7 +144,7 @@ class IdentityConfig:
 class CrossSampleConfig:
     """Configuration for Cross Sampling (Fake History)."""
 
-    enabled: bool = True
+    enabled: bool = False
     probability: float = 0.5
     max_history_tokens: int = 512
 
@@ -153,7 +153,7 @@ class CrossSampleConfig:
 class SystemPromptConfig:
     """Configuration for system prompt strategy."""
 
-    use_system_prompts: bool = True
+    use_system_prompts: bool = False
     system_prompt_probability: float = 0.2  # 20% system prompt, 80% few-shot
     use_short_when_augmented: bool = (
         True  # Use short prompt when identity/cross-sample active
