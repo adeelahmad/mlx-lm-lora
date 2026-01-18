@@ -11,7 +11,7 @@ Architecture Philosophy:
 - Professional logging and monitoring
 - Multi-Actor diverse policy exploration (NEW)
 
-Version: 5.4.2 - HOTFIX: ADDED MISSING TOKEN ARGS
+Version: 5.4.3 - HOTFIX: ARGUMENT COLLISION
 Author: Synthesis of battle-tested production code + cutting-edge optimizations
 Last Updated: 2025-01-28
 
@@ -2620,7 +2620,7 @@ def _generate_with_batch(
             prompts=batched_prompts,
             max_tokens=max_tokens,
             sampler=sampler,
-            verbose=True,
+            verbose=False,
             **gen_kwargs,
         )
         for idx, completion_text in enumerate(results.texts):
@@ -3401,11 +3401,14 @@ def train_grpo(
     best_val_loss = float("inf")
     multi_actor = initialize_multi_actor(model, args, ".", tokenizer)
 
-    def compute_loss_and_grads(model, *args, **kwargs):
-        loss_val_grad = nn.value_and_grad(model, loss_fn)
+    # Renamed first argument to 'train_model' to avoid collision with 'model' in kwargs
+    def compute_loss_and_grads(train_model, *args, **kwargs):
+        loss_val_grad = nn.value_and_grad(train_model, loss_fn)
         (lvalue, toks, metrics), grads = loss_val_grad(*args, **kwargs)
         grad_norm = 0.0
-        trainable_keys = set(k for k, _ in tree_flatten(model.trainable_parameters()))
+        trainable_keys = set(
+            k for k, _ in tree_flatten(train_model.trainable_parameters())
+        )
         flat_grads = dict(tree_flatten(grads))
         valid_grads = [v for k, v in flat_grads.items() if k in trainable_keys]
         if valid_grads:
@@ -3426,12 +3429,7 @@ def train_grpo(
             new_lr = scheduler.get_lr(it)
             optimizer.learning_rate = mx.array(new_lr)
 
-        if (
-            args.steps_per_eval >= 0
-            and it == 1
-            or it % args.steps_per_eval == 0
-            or it == args.iters
-        ):
+        if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             val_loss, val_tokens, val_metrics = evaluate_grpo(
                 model,
                 ref_model,

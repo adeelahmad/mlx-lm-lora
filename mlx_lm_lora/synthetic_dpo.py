@@ -140,18 +140,18 @@ class PreferenceDatasetCreator:
                     prompt1 = self.tokenizer.apply_chat_template(
                         conversation=conversation1,
                         add_generation_prompt=True,  # Changed to True to add assistant prompt
-                        enable_thinking=False
-                        if is_qwen_model
-                        else None,  # Only for Qwen models
+                        enable_thinking=(
+                            False if is_qwen_model else None
+                        ),  # Only for Qwen models
                         tokenize=False,
                     )
 
                     prompt2 = self.tokenizer.apply_chat_template(
                         conversation=conversation2,
                         add_generation_prompt=True,  # Changed to True to add assistant prompt
-                        enable_thinking=False
-                        if is_qwen_model
-                        else None,  # Only for Qwen models
+                        enable_thinking=(
+                            False if is_qwen_model else None
+                        ),  # Only for Qwen models
                         tokenize=False,
                     )
 

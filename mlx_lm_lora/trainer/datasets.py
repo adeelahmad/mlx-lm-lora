@@ -752,9 +752,9 @@ class GRPODataset:
                         self.logger.add(
                             {
                                 "index": global_idx,
-                                "format": "messages"
-                                if is_messages_format
-                                else "legacy",
+                                "format": (
+                                    "messages" if is_messages_format else "legacy"
+                                ),
                             }
                         )
             except Exception as e:
