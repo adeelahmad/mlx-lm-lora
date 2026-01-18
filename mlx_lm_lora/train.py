@@ -332,7 +332,7 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, help="Minibatch size.")
     parser.add_argument("--iters", type=int, help="Iterations.")
     parser.add_argument("--epochs", type=int, help="Epochs.")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--val-batches", type=int, help="Validation batches.")
     parser.add_argument("--learning-rate", type=float, help="Learning rate.")
     parser.add_argument("--steps-per-report", type=int)
@@ -346,7 +346,7 @@ def build_parser():
     parser.add_argument("--max-completion-length", type=int, default=128)
 
     parser.add_argument("-c", "--config", type=str, help="YAML config.")
-    parser.add_argument("--grad-checkpoint", action="store_true", default=None)
+    parser.add_argument("--grad-checkpoint", action="store_true", default=True)
     parser.add_argument("--wandb", type=str, default=None)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--fuse", action="store_true", default=None)
@@ -363,7 +363,7 @@ def build_parser():
 
     # DPO/ORPO/CPO specific args
     parser.add_argument("--beta", type=float, default=0.02)
-    parser.add_argument("--reward-scaling", type=float, default=1.3)
+    parser.add_argument("--reward-scaling", type=float, default=1.0)
     parser.add_argument("--dpo-cpo-loss-type", type=str, default="sigmoid")
     parser.add_argument("--delta", type=float, default=50.0)
     parser.add_argument("--reference-model-path", type=str, default=None)
@@ -399,8 +399,8 @@ def build_parser():
 
     # GRPO Phased
     parser.add_argument("--use-phased-generation", action="store_true", default=True)
-    parser.add_argument("--phased-thinking-max-tokens", type=int, default=24)
-    parser.add_argument("--phased-answer-max-tokens", type=int, default=40)
+    parser.add_argument("--phased-thinking-max-tokens", type=int, default=192)
+    parser.add_argument("--phased-answer-max-tokens", type=int, default=320)
     parser.add_argument("--phased-min-thinking-tokens", type=int, default=10)
 
     # GRPO Sampling
@@ -414,7 +414,7 @@ def build_parser():
     # GRPO Tracking & Optimization
     parser.add_argument("--track-diversity", action="store_true", default=False)
     parser.add_argument("--track-kl-spikes", action="store_true", default=False)
-    parser.add_argument("--use-compilation", action="store_true", default=True)
+    parser.add_argument("--use-compilation", action="store_true", default=False)
     parser.add_argument("--aggressive-gc", action="store_true", default=True)
     parser.add_argument("--log-samples", action="store_true", default=True)
 
@@ -434,16 +434,14 @@ def build_parser():
     parser.add_argument(
         "--use-lr-scheduler",
         action="store_true",
-        default=True,
+        default=False,
         help="Use Cosine LR Scheduler.",
     )
-    parser.add_argument(
-        "--warmup-steps", type=int, default=100, help="LR warmup steps."
-    )
+    parser.add_argument("--warmup-steps", type=int, default=0, help="LR warmup steps.")
     parser.add_argument(
         "--validate-gradients",
         action="store_true",
-        default=True,
+        default=False,
         help="Check for NaN gradients.",
     )
 
